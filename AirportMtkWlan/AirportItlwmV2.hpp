@@ -226,7 +226,9 @@ public:
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
     void observeAwdlAction(mbuf_t, uint32_t channel, int32_t rssi);
     void observeAwdlData(mbuf_t, uint32_t channel);
-    IOReturn transmitAwdlAnnouncement(const uint8_t *, size_t, MtkAwdl::TxKind, uint8_t);
+    void awdlTxCompleted();
+    IOReturn transmitAwdlAnnouncement(const uint8_t *, size_t, MtkAwdl::TxKind, uint8_t, bool doorbell = true);
+    void flushAwdlData();
     IOReturn setAwdlMacAddress(const uint8_t *, bool);
     uint8_t getAwdlChannel(bool &allowed);
     bool readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &);

@@ -24,10 +24,13 @@ harness = r"""
 
 #define MT_PHY_TYPE_OFDM 1
 #define MT_PHY_TYPE_HT   2
+#define MT_PHY_TYPE_VHT  4
 #define MT_TX_RATE_MODE_SHIFT 6
+#define MT_TX_RATE_NSS_SHIFT  10
 
 static int g_knob_rate = 1;
 static int g_knob_ht = 1;
+static int g_knob_vht = 1;
 
 static int PE_parse_boot_argn(const char *arg, void *ptr, int len)
 {
@@ -41,15 +44,25 @@ static int PE_parse_boot_argn(const char *arg, void *ptr, int len)
         *static_cast<int *>(ptr) = g_knob_ht;
         return 1;
     }
+    if (strcmp(arg, "amtk_awdl_vht") == 0 && g_knob_vht != 1) {
+        *static_cast<int *>(ptr) = g_knob_vht;
+        return 1;
+    }
     return 0;
 }
 
+struct mwx_awdl_completions_stub {
+    uint8_t txRateIdx = 0;
+};
+
 struct mwx_softc {
+    mwx_awdl_completions_stub sc_awdl_completions{};
     uint8_t sc_awdl_rate_idx = 0;
     uint16_t sc_awdl_rate_hold = 0;
-    uint8_t sc_awdl_rate_acks = 0;
+    uint16_t sc_awdl_rate_acks = 0;
     uint8_t sc_awdl_rate_fails = 0;
-    uint8_t sc_awdl_rate_window = 0;
+    uint8_t sc_awdl_rate_consec_fails = 0;
+    uint16_t sc_awdl_rate_window = 0;
 };
 """
 
@@ -59,30 +72,54 @@ static inline uint32_t expected_ofdm(uint16_t rix)
     return (MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | rix;
 }
 
+static inline uint32_t expected_vht(uint16_t nssIdx, uint16_t mcs)
+{
+    return (nssIdx << MT_TX_RATE_NSS_SHIFT) | (MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | mcs;
+}
+
 int main()
 {
     mwx_softc sc{};
     // Initial rung is 6 Mbps OFDM (rix 11).
     assert(mwx_awdl_rate_val(&sc, true) == expected_ofdm(11));
 
-    // Climb all rungs on 5 GHz (6 -> 12 -> 24 -> 36 -> 48 -> 54 -> HT MCS7).
+    // Climb all 11 rungs on 5 GHz (8 consecutive ACKs per rung).
     const uint32_t rungs[] = {
         expected_ofdm(11), expected_ofdm(10), expected_ofdm(9),
         expected_ofdm(13), expected_ofdm(8),  expected_ofdm(12),
         (MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 7,
+        expected_vht(0, 8),
+        expected_vht(1, 5),
+        expected_vht(1, 7),
+        expected_vht(1, 8),
     };
-    for (size_t i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < 10; ++i) {
         assert(mwx_awdl_rate_val(&sc, true) == rungs[i]);
-        for (int a = 0; a < 31; ++a)
+        for (int a = 0; a < 7; ++a)
             mwx_awdl_rate_feedback(&sc, false);
         assert(sc.sc_awdl_rate_idx == i);
         mwx_awdl_rate_feedback(&sc, false);
         assert(sc.sc_awdl_rate_idx == i + 1);
+        assert(sc.sc_awdl_completions.txRateIdx == i + 1);
     }
-    assert(mwx_awdl_rate_val(&sc, true) == rungs[6]);
+    assert(mwx_awdl_rate_val(&sc, true) == rungs[10]);
 
-    // 2.4 GHz (useHt=false) must cap at 54 Mbps OFDM even if idx==6.
+    auto wide = sc;
+    for (int a = 0; a < 8; ++a)
+        mwx_awdl_rate_feedback(&wide, false, true);
+    assert(wide.sc_awdl_rate_idx == 11);
+    assert(mwx_awdl_rate_val(&wide, true, true) == expected_vht(1, 9));
+    assert(mwx_awdl_rate_val(&wide, true, false) == expected_vht(1, 8));
+    mwx_awdl_rate_feedback(&wide, false, false);
+    assert(wide.sc_awdl_rate_idx == 10);
+
+    // 2.4 GHz (useHt=false) must cap at 54 Mbps OFDM even if idx==10.
     assert(mwx_awdl_rate_val(&sc, false) == expected_ofdm(12));
+
+    // amtk_awdl_vht=0 must cap 5 GHz at HT MCS7.
+    g_knob_vht = 0;
+    assert(mwx_awdl_rate_val(&sc, true) == rungs[6]);
+    g_knob_vht = 1;
 
     // amtk_awdl_ht=0 must cap 5 GHz at 54 Mbps OFDM too.
     g_knob_ht = 0;
@@ -94,25 +131,41 @@ int main()
     assert(mwx_awdl_rate_val(&sc, true) == expected_ofdm(11));
     g_knob_rate = 1;
 
-    // Unconfirmed single failure steps down immediately and arms 256-ack holdback.
-    sc.sc_awdl_rate_acks = 4;
+    // Isolated 1-2 misses must NOT drop the rung (prevents edge-jitter death spiral).
     mwx_awdl_rate_feedback(&sc, true);
-    assert(sc.sc_awdl_rate_idx == 5 && sc.sc_awdl_rate_hold == 256);
+    mwx_awdl_rate_feedback(&sc, true);
+    assert(sc.sc_awdl_rate_idx == 10);
+
+    // 3rd consecutive failure steps down immediately and arms 16-ack holdback.
+    mwx_awdl_rate_feedback(&sc, true);
+    assert(sc.sc_awdl_rate_idx == 9 && sc.sc_awdl_rate_hold == 16);
 
     // Subsequent ACKs decrement holdback first without climbing prematurely.
-    for (int a = 0; a < 256; ++a)
+    for (int a = 0; a < 16; ++a)
         mwx_awdl_rate_feedback(&sc, false);
-    assert(sc.sc_awdl_rate_idx == 5 && sc.sc_awdl_rate_hold == 0);
+    assert(sc.sc_awdl_rate_idx == 9 && sc.sc_awdl_rate_hold == 0);
 
-    // Exponential backoff caps at 4096 after repeated failures.
-    for (int step = 0; step < 6; ++step)
+    // >=4 failures within a 16-frame window (>=25% loss) also steps down.
+    sc.sc_awdl_rate_window = 0;
+    sc.sc_awdl_rate_fails = 0;
+    for (int k = 0; k < 3; ++k) {
         mwx_awdl_rate_feedback(&sc, true);
-    assert(sc.sc_awdl_rate_idx == 0 && sc.sc_awdl_rate_hold == 4096);
+        mwx_awdl_rate_feedback(&sc, false);
+    }
+    assert(sc.sc_awdl_rate_idx == 9);
+    mwx_awdl_rate_feedback(&sc, true);
+    assert(sc.sc_awdl_rate_idx == 8 && sc.sc_awdl_rate_hold == 16);
+
+    // Bounded exponential backoff caps at 64 after repeated drops (never 4096 death spiral).
+    for (int step = 0; step < 30; ++step)
+        mwx_awdl_rate_feedback(&sc, true);
+    assert(sc.sc_awdl_rate_idx == 0 && sc.sc_awdl_rate_hold == 64);
+    assert(sc.sc_awdl_completions.txRateIdx == 0);
 
     // Null guard.
     mwx_awdl_rate_feedback(nullptr, true);
 
-    puts("PASS: extracted AWDL Connac2 rate ladder (6..54 Mbps OFDM + HT MCS7, channel 6/HT caps, boot-args, exponential backoff) under ASan/UBSan.");
+    puts("PASS: extracted AWDL Connac2 rate ladder (OFDM/HT/VHT 2SS, 8-ACK climb, 3-consec/25%-window drop, 16..64 cooldown) under ASan/UBSan.");
     return 0;
 }
 """

@@ -346,7 +346,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     scanSource->setTimeoutMS(20000);
     if (ic->ic_state == IEEE80211_S_RUN) {
+        ic->ic_wcl_scan_cache_ok =
+            !scan.ssidLength && !scan.targets.count && !RB_EMPTY(&ic->ic_tree);
         ieee80211_begin_cache_bgscan(&ic->ic_if);
+        ic->ic_wcl_scan_cache_ok = false;
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
             ic->ic_wcl_scan_requested = false;
             if (!RB_EMPTY(&ic->ic_tree)) {

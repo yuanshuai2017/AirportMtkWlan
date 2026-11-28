@@ -8,6 +8,11 @@ struct PeerIdentity {
     char hostname[64] = {};
 };
 
+inline bool idleTimingPeerExpired(uint64_t now, uint64_t currentSync, uint64_t candidateSync)
+{
+    return now >= currentSync && now - currentSync >= 3000000 && candidateSync > currentSync;
+}
+
 inline unsigned lowerASCII(unsigned c)
 {
     return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;

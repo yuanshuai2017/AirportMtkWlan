@@ -17,6 +17,7 @@ fn_write_gw = extract_fn(cpp_src, "size_t writeLinkGateway(")
 
 test_code = r"""
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,22 @@ test_code = r"""
 
 int main()
 {
+    const auto shared = MtkAwdlNdp::addedRoute(EEXIST, EEXIST);
+    assert(shared.present && !shared.owned);
+    const auto own = MtkAwdlNdp::addedRoute(0, EEXIST);
+    assert(own.present && own.owned);
+    const auto retry = MtkAwdlNdp::addedRoute(EAGAIN, EEXIST);
+    assert(!retry.present && !retry.owned);
+    auto cached = shared;
+    assert(!MtkAwdlNdp::shouldAddHost(cached, false, true));
+    assert(!MtkAwdlNdp::shouldAddHost(cached, true, true));
+    assert(MtkAwdlNdp::shouldAddHost(cached, false, false));
+    assert(!MtkAwdlNdp::noteHostAdd(cached, EEXIST, EEXIST) && cached.present && !cached.owned);
+    assert(MtkAwdlNdp::noteHostAdd(cached, 0, EEXIST) && cached.present && cached.owned);
+    assert(!MtkAwdlNdp::noteHostAdd(cached, EEXIST, EEXIST) && cached.owned);
+    assert(!MtkAwdlNdp::noteHostAdd(cached, EAGAIN, EEXIST) && cached.owned);
+    MtkAwdlNdp::RoutePresence fresh;
+    assert(!MtkAwdlNdp::noteHostAdd(fresh, 0, EEXIST) && fresh.owned);
     uint8_t ip6[16] = {};
     const uint8_t mac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
     // KAME embedded scope ID 0x001a + EUI-64 bit invert (0x02 ^ 0x02 == 0x00).

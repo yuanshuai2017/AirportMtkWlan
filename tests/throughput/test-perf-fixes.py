@@ -33,6 +33,8 @@ fn_rearm = extract_fn(inp_src, "ieee80211_input_ba_rearm_timeout(struct ieee8021
 harness = r'''
 #define TEST_HARNESS 1
 #include <cassert>
+#include <algorithm>
+using std::max;
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -226,7 +228,6 @@ struct ieee80211_frame { uint8_t i_fc[2]; uint8_t i_dur[2]; uint8_t i_addr1[6]; 
 struct ieee80211_node {};
 class IOEthernetController;
 static void mtkAwdlObserveAction(IOEthernetController *, mbuf *, uint32_t, int32_t) {}
-static void mtkAwdlObserveData(void *, mbuf *, unsigned int) {}
 struct ieee80211_rxinfo { uint32_t rxi_flags = 0; uint16_t rxi_chan = 0; int8_t rxi_rssi = 0; };
 struct ifqueue {
     std::deque<mbuf*> q;
@@ -246,7 +247,9 @@ static inline mbuf *mq_dequeue(mgtqueue *q) {
     mbuf *m = q->q.front(); q->q.pop_front(); return m;
 }
 struct netstat_t { uint64_t inputPackets = 0, outputPackets = 0, outputErrors = 0; };
+constexpr int LINK_STATE_UP = 2;
 struct _ifnet {
+    int if_link_state = 0;
     void *if_softc = nullptr;
     netstat_t *netStat = nullptr;
     uint32_t if_flags = 0;
@@ -277,12 +280,16 @@ struct ieee80211com {
     ieee80211_he_mcs_nss_supp ic_he_mcs_nss_supp = {};
     ieee80211_edca_ac_params ic_edca_ac[4] = {};
     bool ic_wcl_scan_requested = false;
+    bool ic_wcl_scan_cache_ok = false;
     bool ic_wcl_scan_restricted = false;
     uint8_t ic_wcl_scan_ssid_length = 0;
 };
 struct mwx_vif { uint8_t idx = 0, wmm_idx = 0; };
 struct mwx_softc {
     ieee80211com sc_ic;
+    int sc_ns_state = 0;
+    struct { bool active = false; uint64_t lastDataAckUS = 0, lastDataRxUS = 0; } sc_awdl_peer;
+    struct { unsigned bgScanDeferred = 0; unsigned dataInFlight = 0; } sc_awdl_completions;
     struct { uint8_t num_streams = 0; } sc_capa;
     mwx_vif sc_vif;
     uint32_t sc_flags = 0;
@@ -411,6 +418,11 @@ static void mwx_amsdu_add(mwx_softc *sc, mbuf *m, ieee80211_rxinfo*, mbuf_list*)
 }
 static void mwx_amsdu_flush(mwx_softc *sc, mbuf_list*) { g_amsdu_flush_calls++; sc->sc_amsdu_n = 0; }
 static void mwx_rx_deliver(mwx_softc*, mbuf *m, ieee80211_rxinfo*, mbuf_list*) { g_rx_deliver_calls++; m_freem(m); }
+static void mwx_awdl_rx_data(mwx_softc *, mbuf *m, uint8_t) { m_freem(m); }
+static bool mwx_awdl_rx_ba_bar(mwx_softc *, mbuf *, uint8_t) { return false; }
+static bool g_awdl_ba_consumed = false;
+static bool mwx_awdl_ba_rx(mwx_softc *, mbuf *, uint8_t) { return g_awdl_ba_consumed; }
+
 static int mt7921_mcu_hw_scan(mwx_softc*, int) { g_hw_scan_calls++; return 0; }
 static int mwx_mcu_send_msg(mwx_softc*, int cmd, void *data, int len, void*) {
     assert(cmd == MCU_CE_CMD_SET_EDCA_PARMS);
@@ -625,6 +637,35 @@ static void test_edca_and_bgscan() {
     sc.sc_ic.ic_wcl_scan_ssid_length = 6;
     assert(mwx_bgscan(&sc.sc_ic) == 0);
     assert(g_hw_scan_calls == 2);
+
+    // AWDL defers wildcard WCL scans while recent unicast traffic is active
+    // (5 s grace or in-flight data), while preserving directed and recovery scans.
+    mwx_softc awdl = {};
+    awdl.sc_ic.ic_softc = &awdl;
+    awdl.sc_ic.ic_state = awdl.sc_ns_state = IEEE80211_S_RUN;
+    awdl.sc_ic.ic_if.if_link_state = LINK_STATE_UP;
+    awdl.sc_ic.ic_wcl_scan_requested = awdl.sc_ic.ic_wcl_scan_restricted = true;
+    awdl.sc_ic.ic_wcl_scan_cache_ok = true;
+    awdl.sc_awdl_peer.active = true;
+    awdl.sc_awdl_peer.lastDataAckUS = g_fake_ns / 1000;
+    assert(mwx_bgscan(&awdl.sc_ic) == EBUSY);
+    assert(awdl.sc_awdl_completions.bgScanDeferred == 1 && g_hw_scan_calls == 2);
+    g_fake_ns += 4000000000ULL;
+    assert(mwx_bgscan(&awdl.sc_ic) == EBUSY && awdl.sc_awdl_completions.bgScanDeferred == 2);
+    awdl.sc_awdl_peer.lastDataRxUS = g_fake_ns / 1000;
+    g_fake_ns += 5000000000ULL;
+    awdl.sc_awdl_completions.dataInFlight = 1;
+    assert(mwx_bgscan(&awdl.sc_ic) == EBUSY && awdl.sc_awdl_completions.bgScanDeferred == 3);
+    awdl.sc_awdl_completions.dataInFlight = 0;
+    assert(mwx_bgscan(&awdl.sc_ic) == 0 && g_hw_scan_calls == 3);
+    awdl.sc_flags = 0;
+    awdl.sc_awdl_peer.lastDataRxUS = g_fake_ns / 1000;
+    awdl.sc_ns_state = 0;
+    assert(mwx_bgscan(&awdl.sc_ic) == 0 && g_hw_scan_calls == 4);
+    awdl.sc_flags = 0;
+    awdl.sc_ns_state = IEEE80211_S_RUN;
+    awdl.sc_ic.ic_wcl_scan_cache_ok = false;
+    assert(mwx_bgscan(&awdl.sc_ic) == 0 && g_hw_scan_calls == 5);
 }
 
 static void test_aspm_disable() {
@@ -835,6 +876,18 @@ static void test_awdl_action_observation() {
     assert(sc.sc_awdl_diag_frames == 0);
     receive(sizeof(awdl), true);
     assert(sc.sc_awdl_diag_frames == 1);
+
+    // A block-ack action claimed by AWDL never reaches the infrastructure RX path.
+    auto *m = new mbuf();
+    m->len = m->pktlen = sizeof(ieee80211_frame) + 9;
+    mtod(m, ieee80211_frame *)->i_fc[0] = IEEE80211_FC0_SUBTYPE_ACTION;
+    m->data[sizeof(ieee80211_frame)] = 3;
+    m->data[sizeof(ieee80211_frame) + 1] = 1;
+    const auto delivered = g_rx_deliver_calls;
+    g_awdl_ba_consumed = true;
+    mwx_rx(&sc, m, &ml);
+    assert(g_rx_deliver_calls == delivered && sc.sc_awdl_diag_frames == 1);
+    g_awdl_ba_consumed = false;
     awdl_diag_armed = false;
 }
 

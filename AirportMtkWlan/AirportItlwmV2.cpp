@@ -22,6 +22,8 @@
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSCollectionIterator.h>
 #include <kern/task.h>
 #include "MtkAwdlInterface.hpp"
 #endif
@@ -35,19 +37,130 @@ IOCommandGate *_fCommandGate;
 
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 unsigned int mtk_awdl_diagnostics_armed;
+
+static bool readAwdlTuneBool(OSObject *obj, bool &out)
+{
+    if (auto *b = OSDynamicCast(OSBoolean, obj)) {
+        out = b->getValue();
+        return true;
+    }
+    if (auto *n = OSDynamicCast(OSNumber, obj)) {
+        const uint64_t v = n->unsigned64BitValue();
+        if (v > 1)
+            return false;
+        out = v != 0;
+        return true;
+    }
+    return false;
+}
+
+static bool parseAwdlTuneDict(OSDictionary *tuneDict, MtkAwdl::PeerTuneRequest &req)
+{
+    if (!tuneDict || tuneDict->getCount() == 0 || tuneDict->getCount() > 8)
+        return false;
+    OSCollectionIterator *iter = OSCollectionIterator::withCollection(tuneDict);
+    if (!iter)
+        return false;
+    bool ok = true;
+    while (auto *keyObj = iter->getNextObject()) {
+        auto *keySym = OSDynamicCast(OSSymbol, keyObj);
+        const char *key = keySym ? keySym->getCStringNoCopy() : nullptr;
+        OSObject *val = keySym ? tuneDict->getObject(keySym) : nullptr;
+        if (!key || !val) {
+            ok = false;
+            break;
+        }
+        if (strcmp(key, "fixed_ba") == 0) {
+            ok = readAwdlTuneBool(val, req.fixedBa);
+            req.setFixedBa = true;
+        } else if (strcmp(key, "bw") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            const uint64_t v = n ? n->unsigned64BitValue() : 0;
+            if (!n || (v != 20 && v != 40 && v != 80)) {
+                ok = false;
+                break;
+            }
+            req.maxBw = uint8_t(v);
+            req.setMaxBw = true;
+        } else if (strcmp(key, "cap_mask") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            if (!n || n->unsigned64BitValue() > 0x3f) {
+                ok = false;
+                break;
+            }
+            req.capMask = uint8_t(n->unsigned64BitValue());
+            req.setCapMask = true;
+        } else if (strcmp(key, "sco") == 0) {
+            ok = readAwdlTuneBool(val, req.matchingSco);
+            req.setMatchingSco = true;
+        } else if (strcmp(key, "two_stage") == 0) {
+            ok = readAwdlTuneBool(val, req.twoStage);
+            req.setTwoStage = true;
+        } else if (strcmp(key, "reset_stats") == 0) {
+            ok = readAwdlTuneBool(val, req.resetStats);
+        } else {
+            ok = false;
+        }
+        if (!ok)
+            break;
+    }
+    iter->release();
+    return ok;
+}
 #endif
 
 IOReturn AirportItlwm::setProperties(OSObject *properties)
 {
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
     auto *dict = OSDynamicCast(OSDictionary, properties);
+    auto *tuneObj = dict ? dict->getObject("MtkAwdlTune") : nullptr;
     const bool data = dict && dict->getObject("MtkArmAwdlIPv6");
     auto *hostname = dict ? dict->getObject("MtkArmAwdlHostname") : nullptr;
-    if (!dict || (!data && !hostname && !dict->getObject("MtkArmAwdlDiagnostics")))
+    if (!dict || (!tuneObj && !data && !hostname && !dict->getObject("MtkArmAwdlDiagnostics")))
         return super::setProperties(properties);
-    MtkAwdl::PeerIdentity peer;
     if (dict->getCount() != 1)
         return kIOReturnBadArgument;
+    if (tuneObj) {
+        auto *tuneDict = OSDynamicCast(OSDictionary, tuneObj);
+        MtkAwdl::PeerTuneRequest tuneReq;
+        if (!parseAwdlTuneDict(tuneDict, tuneReq))
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+            kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        if (!_fCommandGate || !awdlRegistrationLock)
+            return kIOReturnNotReady;
+        if (!mtkAwdlTahoeAbiMatches()) {
+            setProperty("MtkAwdlStage", "unsupported-build-or-abi");
+            return kIOReturnUnsupported;
+        }
+        return _fCommandGate->runAction([](OSObject *owner, void *reqPtr, void *, void *, void *) -> IOReturn {
+            auto *self = static_cast<AirportItlwm *>(owner);
+            if (!self->fHalService)
+                return kIOReturnNotReady;
+            const auto &req = *static_cast<const MtkAwdl::PeerTuneRequest *>(reqPtr);
+            const IOReturn result = self->fHalService->tuneAwdlPeer(req);
+            if (result != kIOReturnSuccess)
+                return result;
+            MtkAwdl::AnnouncementCompletions counts;
+            if (self->fHalService->readAwdlAnnouncementCompletions(counts)) {
+                char summary[128];
+                snprintf(summary, sizeof(summary),
+                    "gen=%u fixed_ba=%u max_bw=%u bw=%u cap_mask=0x%02x sco=%u two_stage=%u",
+                    counts.peerTuneGen, unsigned(counts.peerFixedBa), unsigned(counts.peerMaxBw),
+                    unsigned(counts.peerBw), unsigned(counts.peerCapMask),
+                    unsigned(counts.peerMatchingSco), unsigned(counts.peerTwoStage));
+                self->setProperty("MtkAwdlTuneApplied", summary);
+            }
+            if (IOLockTryLock(self->awdlRegistrationLock)) {
+                if (!self->awdlStopping && self->fAwdlIf)
+                    static_cast<MtkAWDLInterface *>(self->fAwdlIf)->publishCompletions(self);
+                IOLockUnlock(self->awdlRegistrationLock);
+            }
+            return kIOReturnSuccess;
+        }, &tuneReq);
+    }
+    MtkAwdl::PeerIdentity peer;
     if (data) {
         if (dict->getObject("MtkArmAwdlIPv6") != kOSBooleanTrue)
             return kIOReturnBadArgument;
@@ -2019,11 +2132,17 @@ void mtkAwdlObserveAction(IOEthernetController *owner, mbuf_t packet, uint32_t c
         controller->observeAwdlAction(packet, channel, rssi);
 }
 
-IOReturn AirportItlwm::transmitAwdlAnnouncement(const uint8_t *bytes, size_t length, MtkAwdl::TxKind kind, uint8_t channel)
+IOReturn AirportItlwm::transmitAwdlAnnouncement(const uint8_t *bytes, size_t length, MtkAwdl::TxKind kind, uint8_t channel, bool doorbell)
 {
     if (!mtk_awdl_diagnostics_enabled() || !fHalService)
         return kIOReturnNotReady;
-    return fHalService->transmitAwdlAnnouncement(bytes, length, kind, channel);
+    return fHalService->transmitAwdlAnnouncement(bytes, length, kind, channel, doorbell);
+}
+
+void AirportItlwm::flushAwdlData()
+{
+    if (fHalService)
+        fHalService->flushAwdlData();
 }
 
 IOReturn AirportItlwm::setAwdlMacAddress(const uint8_t *mac, bool enable)
@@ -2067,6 +2186,22 @@ void AirportItlwm::observeAwdlData(mbuf_t packet, uint32_t channel)
         return;
     if (mtk_awdl_diagnostics_enabled() && fAwdlIf && !fAwdlIf->isInactive())
         static_cast<MtkAWDLInterface *>(fAwdlIf)->observeData(packet, channel);
+    IOLockUnlock(awdlRegistrationLock);
+}
+
+void mtkAwdlTxCompleted(IOEthernetController *owner)
+{
+    if (auto *controller = OSDynamicCast(AirportItlwm, owner))
+        controller->awdlTxCompleted();
+}
+
+void AirportItlwm::awdlTxCompleted()
+{
+    if (!_fWorkloop || !_fWorkloop->inGate() || !awdlRegistrationLock ||
+        !IOLockTryLock(awdlRegistrationLock))
+        return;
+    if (fAwdlIf)
+        static_cast<MtkAWDLInterface *>(fAwdlIf)->scheduleDataPump();
     IOLockUnlock(awdlRegistrationLock);
 }
 

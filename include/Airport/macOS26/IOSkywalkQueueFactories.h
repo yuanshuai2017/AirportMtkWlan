@@ -20,4 +20,10 @@ extern "C" IOEventSource *itlMakeRxSubmission(IOSkywalkPacketBufferPool*, UInt32
     __asm__("__ZN26IOSkywalkRxSubmissionQueue8withPoolEP25IOSkywalkPacketBufferPooljjjP8OSObjectPFjS3_PS_PKP15IOSkywalkPacketjPvES9_j");
 extern "C" IOEventSource *itlMakeRxCompletion(IOSkywalkPacketBufferPool*, UInt32, UInt32, OSObject*, ItlRxCompleteAction, void*, UInt32)
     __asm__("__ZN26IOSkywalkRxCompletionQueue8withPoolEP25IOSkywalkPacketBufferPooljjP8OSObjectPFjS3_PS_PP15IOSkywalkPacketjPvES8_j");
+extern "C" IOReturn itlTxRequestDequeue(void*, void*, UInt32)
+    __asm__("__ZN26IOSkywalkTxSubmissionQueue14requestDequeueEPvj");
+extern "C" IOReturn itlReportLinkQuality(void*, UInt32)
+    __asm__("__ZN25IOSkywalkNetworkInterface17reportLinkQualityEj");
+extern "C" IOReturn itlReportDataBandwidths(void*, UInt64, UInt64, UInt64, UInt64)
+    __asm__("__ZN25IOSkywalkNetworkInterface20reportDataBandwidthsEyyyy");
 static_assert(sizeof(IOSkywalkPacketBufferPool::PoolOptions)==0x20, "Native pool option ABI");

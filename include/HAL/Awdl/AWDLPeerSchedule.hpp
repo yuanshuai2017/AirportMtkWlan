@@ -36,6 +36,8 @@ struct PeerSyncInfo {
     // TLV 4's AW extension and common lengths (TU) and presence mode, for the Apple election rules.
     uint16_t awExtTU, awCommonTU;
     uint8_t presenceMode;
+    uint8_t masterChannel;
+    uint8_t master[6];
 };
 
 // Reads the AW counter, down counter and period from TLV 4 and the 16 channels from TLV 18.
@@ -57,6 +59,8 @@ inline bool peerSyncFromAction(const uint8_t *f, size_t length, PeerSyncInfo *ou
             info.awExtTU = uint16_t(v[11] | v[12] << 8);
             info.awCommonTU = uint16_t(v[13] | v[14] << 8);
             info.presenceMode = v[27];
+            info.masterChannel = v[3];
+            memcpy(info.master, v + 21, sizeof(info.master));
             haveSync = v[27] == 4 && info.awPeriodTU >= 8 && info.awPeriodTU <= 64 &&
                        info.downCounterTU <= uint32_t(info.awPeriodTU) * 4;
         } else if (f[i] == 18) {
@@ -96,6 +100,12 @@ struct PeerWindowEvidence {
     }
     unsigned matches() const { return __builtin_popcount(history); }
     bool reliable() const { return samples >= 8 && matches() * 4 >= unsigned(samples) * 3; }
+
+    bool reanchor(bool continuousSequence) {
+        if (continuousSequence && reliable()) return true;
+        *this = {};
+        return false;
+    }
 };
 
 struct PeerSchedule {
@@ -147,8 +157,8 @@ struct PeerSchedule {
     enum class Update { Initial, Stable, Sequence, Gap, Phase };
     int32_t phaseErrorUS;
 
-    // Keep the peer's AW numbering, but filter host RX jitter. For a stable
-    // sequence, move the predicted boundary a quarter of the measured error.
+    // Preserve a phase-continuous anchor across bitmap changes. Filter host RX
+    // jitter by moving the predicted boundary a quarter of the measured error.
     Update note(const PeerSyncInfo &s, uint64_t nowUS, uint8_t channel) {
         const uint64_t newPeriod = uint64_t(s.awPeriodTU) * 4 * 1024;
         const uint64_t measuredEnd = nowUS + uint64_t(s.downCounterTU) * 1024;
@@ -158,10 +168,9 @@ struct PeerSchedule {
         if (valid) {
             if (!fresh(nowUS) || channel != ourChannel || newPeriod != eawUS) {
                 result = Update::Gap;
-            } else if (memcmp(channels, s.channels, sizeof(channels))) {
-                ++sequenceChanges;
-                result = Update::Sequence;
             } else {
+                const bool sequenceChanged = memcmp(channels, s.channels, sizeof(channels)) != 0;
+                sequenceChanges += sequenceChanged;
                 uint64_t into = 0;
                 const uint32_t predicted = eawAt(measuredEnd, &into);
                 const uint32_t expected = s.awCounter / 4 + 1;
@@ -172,12 +181,14 @@ struct PeerSchedule {
                 if (after || before) {
                     phaseErrorUS = after ? int32_t(into) : -int32_t(eawUS - into);
                     filteredEnd = uint64_t(int64_t(measuredEnd) - int64_t(phaseErrorUS) * 3 / 4);
-                    result = Update::Stable;
+                    result = sequenceChanged ? Update::Sequence : Update::Stable;
                 } else {
                     result = Update::Phase;
                 }
             }
-            if (result != Update::Stable)
+            if (result == Update::Sequence)
+                clearEvidence();  // Slot statistics belong to the old bitmap.
+            else if (result != Update::Stable)
                 invalidate();
         }
         memcpy(channels, s.channels, sizeof(channels));
@@ -199,6 +210,12 @@ struct PeerSchedule {
     }
     bool presentInEntry(uint32_t eaw) const {
         return channels[(eaw + entryOffset()) % kPeerSeqEntries] == ourChannel;
+    }
+    // An unspecified slot does not establish presence, but it also does not
+    // establish that the peer has left our channel.
+    bool awayForData(uint32_t eaw) const {
+        const uint8_t channel = channels[(eaw + entryOffset()) % kPeerSeqEntries];
+        return channel && channel != ourChannel;
     }
     // Every frame heard from the peer. Feeds calibration, then checks it.
     void notePeerFrame(uint64_t t) {
@@ -237,19 +254,33 @@ struct PeerSchedule {
         }
     }
     // Picks the offset where the fewest of the peer's frames fall in entries that say it's away.
-    // Only when there is an away entry to tell offsets apart, and the best one is nearly clean.
+    // Accept only a nearly clean, unique presence bitmap. Equivalent offsets are
+    // visited in order, so the first one is the smallest representative.
     void calibrate() {
         unsigned away = 0;
         for (unsigned k = 0; k < kPeerSeqEntries; ++k) away += channels[k] != ourChannel;
         if (!away || away == kPeerSeqEntries) return;
         uint32_t best = 0xffffffff, second = 0xffffffff;
         uint8_t bestOffset = 0;
+        uint16_t bestBitmap = 0;
         for (unsigned r = 0; r < kPeerSeqEntries; ++r) {
             uint32_t inAway = 0;
-            for (unsigned s = 0; s < kPeerSeqEntries; ++s)
-                if (channels[(s + r) % kPeerSeqEntries] != ourChannel) inAway += bins[s];
-            if (inAway < best) { second = best; best = inAway; bestOffset = uint8_t(r); }
-            else if (inAway < second) second = inAway;
+            uint16_t bitmap = 0;
+            for (unsigned s = 0; s < kPeerSeqEntries; ++s) {
+                if (channels[(s + r) % kPeerSeqEntries] == ourChannel)
+                    bitmap |= uint16_t(1U << s);
+                else
+                    inAway += bins[s];
+            }
+            if (bitmap == bestBitmap) continue;
+            if (inAway < best) {
+                second = best;
+                best = inAway;
+                bestOffset = uint8_t(r);
+                bestBitmap = bitmap;
+            } else if (inAway < second) {
+                second = inAway;
+            }
         }
         if (best * 100 > binFrames * kPeerCalibrateMaxAwayPercent || second <= best) return;
         offset = bestOffset;
@@ -303,16 +334,58 @@ struct PeerSchedule {
         for (unsigned k = 0; k < kPeerSeqEntries && !presentInEntry(eaw); ++k, ++eaw) limit += eawUS;
         return limit > kPeerPauseCeilingUS ? kPeerPauseCeilingUS : limit;
     }
+    // The early margin decides when to pause. At that point the budget uses
+    // the actual time until the peer leaves.
+    uint64_t pauseLimitDataUS(uint64_t t, uint64_t /*earlyUS*/, uint64_t lateUS) const {
+        if (!known() || !fresh(t) || !eawUS) return kPeerPauseMaxUS;
+        uint64_t into = 0;
+        uint32_t eaw = eawAt(t, &into);
+        uint64_t limit;
+        if (!awayForData(eaw)) {
+            limit = usUntilAway(t);
+            if (limit == UINT64_MAX) return kPeerPauseMaxUS;
+            eaw += uint32_t((into + limit) / eawUS);
+        } else {
+            limit = eawUS - into;
+            ++eaw;
+        }
+        for (unsigned k = 0; k < kPeerSeqEntries && awayForData(eaw); ++k, ++eaw)
+            limit += eawUS;
+        constexpr uint64_t phaseMarginUS = 4000;
+        if (limit + phaseMarginUS >= kPeerPauseCeilingUS ||
+            lateUS >= kPeerPauseCeilingUS - limit - phaseMarginUS) return kPeerPauseCeilingUS;
+        return limit + lateUS + phaseMarginUS;
+    }
     // Whether sending should be paused at `t`: within the early margin before an away entry,
     // during it, or within the late margin after it.
+    bool shouldPauseData(uint64_t t, uint64_t earlyUS, uint64_t lateUS) const {
+        if (!known() || !fresh(t) || !eawUS) return false;
+        uint64_t into = 0;
+        const uint32_t eaw = eawAt(t, &into);
+        if (awayForData(eaw)) return true;
+        if (usUntilAway(t) <= earlyUS) return true;
+        if (into < lateUS && awayForData(eaw - 1)) return true;
+        return false;
+    }
+    uint64_t usUntilAway(uint64_t t) const {
+        if (!known() || !fresh(t) || !eawUS) return UINT64_MAX;
+        uint64_t into = 0;
+        uint32_t eaw = eawAt(t, &into);
+        if (awayForData(eaw)) return 0;
+        uint64_t rem = eawUS - into;
+        for (unsigned k = 1; k < kPeerSeqEntries; ++k) {
+            if (awayForData(eaw + k)) return rem;
+            rem += eawUS;
+        }
+        return UINT64_MAX;
+    }
     bool shouldPause(uint64_t t) const {
         if (!known() || !fresh(t) || !eawUS) return false;
         uint64_t into = 0;
         const uint32_t eaw = eawAt(t, &into);
-        if (!presentInEntry(eaw)) return true;
-        if (eawUS - into <= kPeerPauseEarlyUS && !presentInEntry(eaw + 1)) return true;
-        if (into < kPeerResumeLateUS && !presentInEntry(eaw - 1)) return true;
-        return false;
+        return !presentInEntry(eaw) ||
+            (eawUS - into <= kPeerPauseEarlyUS && !presentInEntry(eaw + 1)) ||
+            (into < kPeerResumeLateUS && !presentInEntry(eaw - 1));
     }
     // iface161 send gate, for frames to the peer outside an aggregated bulk send. Away: the schedule has it
     // off our channel (with the pause margins). Doze: it is on our channel but idle (`dozing`), and `t` is
@@ -331,14 +404,41 @@ struct PeerSchedule {
     }
 };
 
-// Turns the wish to pause into commands: pauses and resumes only on a change, and never stays
-// paused past kPeerPauseMaxUS.
+// While the peer's timing is being rebuilt, refill a small burst at most
+// once per tick. A fresh RX can open the next burst early.
+struct PeerDataProbe {
+    static constexpr uint64_t intervalUS = 2000;
+    static constexpr uint64_t rxWindowUS = 4500;
+    static constexpr unsigned maxInFlight = 4;
+    uint64_t lastRxUS = 0;
+    uint64_t lastTxUS = 0;
+
+    bool canRefill(uint64_t now) const {
+        return !lastTxUS || (now >= lastTxUS && now - lastTxUS >= intervalUS) ||
+            (lastRxUS > lastTxUS && now >= lastRxUS && now - lastRxUS < rxWindowUS);
+    }
+};
+
+// Pause and resume on a change. Data pauses may use a schedule-specific limit
+// bounded by kPeerPauseCeilingUS.
 constexpr uint64_t kPeerPauseHoldOffUS = 50000;     // After a forced resume, no pause for this long.
 struct PeerPauseState {
     bool paused;
     uint64_t pausedSinceUS, pausedTotalUS, holdOffUntilUS;
     uint32_t pauses, resumes, forcedResumes, commandErrors, framesHeldBack;
     uint64_t limitUS;  // Of the current pause.
+
+    void refreshLimit(uint64_t now, uint64_t remainingUS) {
+        if (!paused || now < pausedSinceUS) return;
+        const uint64_t elapsed = now - pausedSinceUS;
+        limitUS = elapsed >= kPeerPauseCeilingUS || remainingUS >= kPeerPauseCeilingUS - elapsed
+            ? kPeerPauseCeilingUS : elapsed + remainingUS;
+    }
+
+    bool probeAfterTimeout(bool wantPause, uint64_t now) const {
+        return !paused && wantPause && now < holdOffUntilUS;
+    }
+
     // Returns +1 to pause, -1 to resume, 0 for no change. `limitUS` is used when a pause starts.
     int step(bool want, uint64_t nowUS, uint64_t newLimitUS = kPeerPauseMaxUS) {
         if (paused && nowUS >= pausedSinceUS && nowUS - pausedSinceUS >= (limitUS ? limitUS : kPeerPauseMaxUS)) {

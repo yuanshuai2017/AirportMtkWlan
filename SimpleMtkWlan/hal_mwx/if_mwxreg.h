@@ -1562,6 +1562,28 @@ struct wtbl_rx {
 	uint8_t		rsv[4];
 } __packed;
 
+#define WTBL_HT                         0x02
+struct wtbl_ht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		ht;
+	uint8_t		ldpc;
+	uint8_t		af;
+	uint8_t		mm;
+	uint8_t		rsv[4];
+} __packed;
+
+#define WTBL_VHT                        0x03
+struct wtbl_vht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		ldpc;
+	uint8_t		dyn_bw;
+	uint8_t		vht;
+	uint8_t		txop_ps;
+	uint8_t		rsv[4];
+} __packed;
+
 #define	WTBL_HDR_TRANS			0x06
 struct wtbl_hdr_trans {
 	uint16_t	tag;

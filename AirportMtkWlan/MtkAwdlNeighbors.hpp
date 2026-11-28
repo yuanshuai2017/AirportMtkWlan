@@ -14,7 +14,30 @@ namespace MtkAwdlNdp {
 static constexpr size_t kMaxRouteMsgBytes = 256;
 static constexpr size_t kMaxPeers = 16;
 static constexpr uint64_t kPeerIdleExpireNS = 30ULL * 1000ULL * 1000ULL * 1000ULL;
-static constexpr unsigned kRefreshIntervalPasses = 15;
+struct RoutePresence {
+    bool present = false;
+    bool owned = false;
+};
+inline RoutePresence addedRoute(int error, int alreadyExists) {
+    return {error == 0 || error == alreadyExists, error == 0};
+}
+
+inline bool shouldAddHost(RoutePresence route, bool /*activeData*/, bool sameInterface) {
+    return !route.present || !sameInterface;
+}
+
+// Return true when the ADD restored a previously known route.
+inline bool noteHostAdd(RoutePresence &route, int error, int alreadyExists) {
+    if (error == alreadyExists) {
+        route.present = true;
+        return false;
+    }
+    if (error)
+        return false;  // A transient error does not revoke ownership.
+    const bool restored = route.present;
+    route = {true, true};
+    return restored;
+}
 
 struct Stats {
     bool enabled = false;
@@ -22,6 +45,7 @@ struct Stats {
     uint32_t activeNeighbors = 0;
     uint32_t routeAdds = 0;
     uint32_t neighborAdds = 0;
+    uint32_t reasserts = 0;
     uint32_t neighborDeletes = 0;
     uint32_t errors = 0;
     int32_t lastErrno = 0;
@@ -64,7 +88,7 @@ public:
     void destroy();
 
     void updateDesiredState(bool awdlActive, uint64_t nowNS,
-                            const uint8_t (*peerMacs)[6], size_t peerCount);
+                            const uint8_t (*peerMacs)[6], size_t peerCount, uint16_t dataPeers);
     void stopBlocking();
 
     MtkAwdlNdp::Stats snapshotStats() const;
@@ -72,7 +96,8 @@ public:
 private:
     struct PeerSlot {
         bool used = false;
-        bool owned = false;
+        bool activeData = false;
+        MtkAwdlNdp::RoutePresence route;
         uint8_t mac[6] = {};
         uint64_t lastSeenNS = 0;
         uint32_t ifIndex = 0;
@@ -96,7 +121,7 @@ private:
 
     bool desiredActive = false;
     uint32_t currentIfIndex = 0;
-    bool prefixOwned = false;
+    MtkAwdlNdp::RoutePresence prefixRoute;
     uint32_t passSeq = 0;
     uint64_t latestNowNS = 0;
     PeerSlot peers[MtkAwdlNdp::kMaxPeers] = {};

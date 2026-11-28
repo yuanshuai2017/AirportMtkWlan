@@ -1,9 +1,76 @@
-// Minimal nonaggregated AWDL IPv6 transport. Framing follows ForbiddenItlwm
+// AWDL IPv6 transport framing. Framing follows ForbiddenItlwm
 // (GPL-2.0); this layer does not own Skywalk packets or radio descriptors.
 #pragma once
 #include "Awdl/AWDLDataFrame.hpp"
 
 namespace MtkAwdl {
+
+template <size_t Capacity>
+struct DataPeerActivity {
+    static constexpr uint64_t probeGraceUS = 150000;
+    static constexpr uint64_t routeGraceUS = 10000000;
+    struct Entry {
+        uint8_t mac[6] = {};
+        uint64_t lastActiveDataUS = 0;
+
+        bool recent(uint64_t now, uint64_t limit) const {
+            return lastActiveDataUS && now >= lastActiveDataUS && now - lastActiveDataUS < limit;
+        }
+    } entries[Capacity];
+
+    void note(const uint8_t *mac, uint64_t timestamp) {
+        constexpr uint8_t zero[6] = {};
+        if (!timestamp || (mac[0] & 1) || !memcmp(mac, zero, 6))
+            return;
+        auto *oldest = &entries[0];
+        for (auto &peer : entries) {
+            if (peer.lastActiveDataUS && !memcmp(mac, peer.mac, 6)) {
+                if (timestamp > peer.lastActiveDataUS)
+                    peer.lastActiveDataUS = timestamp;
+                return;
+            }
+            if (peer.lastActiveDataUS < oldest->lastActiveDataUS)
+                oldest = &peer;
+        }
+        if (timestamp > oldest->lastActiveDataUS) {
+            memcpy(oldest->mac, mac, 6);
+            oldest->lastActiveDataUS = timestamp;
+        }
+    }
+
+    uint64_t lastActive(const uint8_t *mac) const {
+        for (const auto &peer : entries)
+            if (peer.lastActiveDataUS && !memcmp(mac, peer.mac, 6))
+                return peer.lastActiveDataUS;
+        return 0;
+    }
+
+    bool recent(const uint8_t *mac, uint64_t now) const {
+        for (const auto &peer : entries)
+            if (peer.recent(now, probeGraceUS) && !memcmp(mac, peer.mac, 6))
+                return true;
+        return false;
+    }
+};
+
+using RecentDataPeers = DataPeerActivity<2>;
+
+// Preserve the Skywalk link across a brief radio interruption. The channel
+// gate still blocks RF submission while there is no permitted channel.
+struct DataLinkGrace {
+    static constexpr uint64_t durationUS = 1000000;
+    uint64_t unavailableSinceUS = 0;
+
+    bool shouldRun(bool channel, bool syncEnabled, bool running, uint64_t now) {
+        if (channel || !syncEnabled || !running)
+            unavailableSinceUS = 0;
+        else if (!unavailableSinceUS)
+            unavailableSinceUS = now;
+        return syncEnabled && (channel || (running && now >= unavailableSinceUS &&
+            now - unavailableSinceUS < durationUS));
+    }
+};
+
 constexpr size_t ethernetMax = 1514;
 
 inline bool linkLocal(const uint8_t *ip)
@@ -61,28 +128,50 @@ inline bool finalizeChecksum(uint8_t *ip, size_t total)
     return true;
 }
 
+// macOS Tahoe x86_64 AirDrop uses BSD socket-flow without kernel tx_time
+// pacing. Clearing L4S ECT(1) on direct P2P TX prevents libquic from enabling
+// its unpaced L4S pacer (which drifts sent_time seconds into the future and
+// freezes PTO loss recovery).
+inline bool clearL4sEct1(uint8_t *ip, size_t total)
+{
+    if (!ip || total < 40 || (ip[0] >> 4) != 6 || (ip[1] & 0x30) != 0x10)
+        return false;
+    ip[1] &= static_cast<uint8_t>(~0x30u);
+    return true;
+}
+
 inline bool buildData(const uint8_t *ethernet, size_t length, uint16_t sequence,
-                      uint8_t *output, size_t capacity, size_t &written)
+                      uint8_t *output, size_t capacity, size_t &written,
+                      bool qos = false, bool *clearedEct1 = nullptr)
 {
     constexpr uint8_t bssid[] = {0, 0x25, 0, 0xff, 0x94, 0x73};
-    if (length < 54 || length > ethernetMax || capacity < length + 26 ||
+    if (clearedEct1)
+        *clearedEct1 = false;
+    if (length < 54 || length > ethernetMax)
+        return false;
+    qos = qos && !(ethernet[0] & 1);
+    const size_t headerLength = qos ? 26 : 24;
+    if (capacity < length + headerLength + 2 ||
         ethernet[12] != 0x86 || ethernet[13] != 0xdd)
         return false;
     size_t payloadLength = 0;
     if (ItlAWDL::buildIPv6DataPayload(ethernet + 14, length - 14, sequence,
-            output + 24, capacity - 24, &payloadLength) != ItlAWDL::BuildResult::Ready ||
-        !finalizeChecksum(output + 40, payloadLength - 16))
+            output + headerLength, capacity - headerLength, &payloadLength) != ItlAWDL::BuildResult::Ready ||
+        !finalizeChecksum(output + headerLength + 16, payloadLength - 16))
         return false;
-    for (size_t i = 0; i < 24; ++i)
+    const bool cleared = clearL4sEct1(output + headerLength + 16, payloadLength - 16);
+    if (clearedEct1)
+        *clearedEct1 = cleared;
+    for (size_t i = 0; i < headerLength; ++i)
         output[i] = 0;
-    output[0] = 0x08;
+    output[0] = qos ? 0x88 : 0x08;
     for (size_t i = 0; i < 6; ++i) {
         output[4 + i] = ethernet[i];
         output[10 + i] = ethernet[6 + i];
         output[16 + i] = bssid[i];
     }
     ItlAWDL::write16(output + 22, uint16_t((sequence & 4095) << 4));
-    written = 24 + payloadLength;
+    written = headerLength + payloadLength;
     return true;
 }
 }

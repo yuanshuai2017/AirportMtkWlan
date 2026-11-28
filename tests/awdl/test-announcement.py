@@ -1,4 +1,4 @@
-"""Verify fixed-channel serialization and preservation of the native service TLV."""
+"""Verify AWDL election, timing, channel sequences and native service preservation."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,16 +12,165 @@ test = r"""
 #include <HAL/MtkAwdlActionFrame.hpp>
 #include <HAL/MtkAwdlPeerIdentity.hpp>
 
+
+const uint8_t *findTLV(const uint8_t *frame, size_t length, uint8_t type, size_t expected)
+{
+    for (size_t offset = 40; offset + 3 <= length;) {
+        const size_t size = ItlAWDL::read16(frame + offset + 1);
+        assert(size <= length - offset - 3);
+        if (frame[offset] == type) {
+            assert(size == expected);
+            return frame + offset + 3;
+        }
+        offset += 3 + size;
+    }
+    return nullptr;
+}
+
+void testElection(const uint8_t *self)
+{
+    using namespace MtkAwdl;
+    const uint8_t root[] = {0x10, 1, 2, 3, 4, 5};
+    const uint8_t phone[] = {0x30, 1, 2, 3, 4, 5};
+    uint8_t peerFrame[126] = {};
+    memcpy(peerFrame + 10, phone, 6);
+    uint8_t *v1 = peerFrame + 40;
+    const uint8_t legacy[] = {5, 19, 0, 0, 0x34, 0x12, 2, 0,
+        0x10, 1, 2, 3, 4, 5, 8, 2, 0, 0, 8, 2, 0, 0};
+    memcpy(v1, legacy, sizeof(legacy));
+    uint8_t *v2 = v1 + sizeof(legacy);
+    const uint8_t current[] = {24, 40, 0, 0x10, 1, 2, 3, 4, 5, 0x20, 1, 2, 3, 4, 5,
+        4, 3, 2, 1, 2, 0, 0, 0, 8, 2, 0, 0, 0x19, 2, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0x6e, 0, 0, 0};
+    memcpy(v2, current, sizeof(current));
+    uint8_t *tree = v2 + sizeof(current);
+    const uint8_t path[] = {20, 18, 0, 0x10, 1, 2, 3, 4, 5, 0x20, 1, 2, 3, 4, 5,
+        0x30, 1, 2, 3, 4, 5};
+    memcpy(tree, path, sizeof(path));
+    constexpr uint64_t anchor = 1000000;
+    PeerElection legacyPeer, peer;
+    assert(parsePeerElection(peerFrame, 40 + sizeof(legacy), anchor, legacyPeer));
+    assert(!legacyPeer.hasCounter && legacyPeer.counter == 1 && legacyPeer.hops == 2 &&
+           legacyPeer.metric == 520 && !memcmp(legacyPeer.master, root, 6));
+    assert(parsePeerElection(peerFrame, sizeof(peerFrame), anchor, peer));
+    assert(peer.hasCounter && peer.counter == 0x01020304 && peer.hops == 2 &&
+           peer.metric == 520 && peer.treeSize == 3 && !memcmp(peer.peer, phone, 6));
+    assert(!parsePeerElection(peerFrame, sizeof(peerFrame) - 1, anchor, peer));
+
+    ItlAWDL::PeerSyncInfo sync{};
+    sync.awPeriodTU = sync.awCommonTU = sync.awExtTU = 16;
+    sync.awCounter = 40;
+    sync.downCounterTU = 64;
+    sync.masterChannel = 149;
+    memcpy(sync.master, root, 6);
+    sync.channels[2] = sync.channels[10] = 149;
+    ItlAWDL::PeerSchedule clock{};
+    clock.note(sync, anchor, 157);
+    AnnouncementTiming timing{nullptr, &clock, &sync, anchor};
+    AdvertisedElection info;
+    ServiceSummary services;
+    uint8_t output[512], tlvs[256];
+    size_t length;
+    const auto build = [&](uint64_t now, bool mi) {
+        assert(buildAnnouncement(self, 157, 42, now, v1, sizeof(peerFrame) - 40,
+            tlvs, sizeof(tlvs), output, sizeof(output), &length, &services, mi, timing, &info));
+        assert(!findTLV(output, length, 5, 19));
+    };
+    const auto expectElection = [&](const uint8_t *master, const uint8_t *parent, uint8_t hops,
+                                    uint16_t metric, const uint8_t (&rlfc)[4]) {
+        uint8_t expected[40] = {};
+        memcpy(expected, master, 6);
+        memcpy(expected + 6, parent, 6);
+        memcpy(expected + 12, rlfc, 4);
+        expected[16] = hops;
+        expected[20] = uint8_t(metric);
+        expected[21] = uint8_t(metric >> 8);
+        expected[24] = 60;
+        expected[36] = 1;
+        const auto *value = findTLV(output, length, 24, sizeof(expected));
+        assert(value && !memcmp(value, expected, sizeof(expected)));
+    };
+    const auto checkSync = [&](const uint8_t *master, uint16_t aw, uint8_t down, uint8_t remain) {
+        const uint8_t *params = findTLV(output, length, 4, 73);
+        assert(params && !memcmp(params + 21, master, 6));
+        assert(ItlAWDL::read16(params + 1) == down && ItlAWDL::read16(params + 15) == remain);
+        assert(ItlAWDL::read16(params + 29) == aw);
+        const uint8_t *channels = findTLV(output, length, 18, 41);
+        assert(channels && params[0] == 157);
+        for (unsigned slot = 0; slot < 16; ++slot) {
+            assert(params[39 + slot * 2] == 0x1b && params[40 + slot * 2] == 157);
+            assert(channels[6 + slot * 2] == 157);
+            assert(channels[7 + slot * 2] == 124);
+        }
+    };
+    const uint8_t standalone[] = {1, 0, 0, 0};
+    const uint8_t followed[] = {4, 3, 2, 1};
+    build(anchor, false);
+    expectElection(self, self, 0, 60, standalone);
+    assert(!info.following);
+    assert(!memcmp(findTLV(output, length, 20, 6), self, 6));
+    checkSync(self, 0, 64, 16);
+
+    timing.peer = &peer;
+    build(anchor + 3072, true);
+    expectElection(root, phone, 3, 520, followed);
+    const uint8_t *resultTree = findTLV(output, length, 20, 24);
+    assert(resultTree && !memcmp(resultTree, path + 3, 18) && !memcmp(resultTree + 18, self, 6));
+    assert(info.following && info.counter == 0x01020304 && info.hops == 3);
+    checkSync(root, 40, 61, 13);
+    assert(findTLV(output, length, 4, 73)[3] == 149);
+
+    // Native re-elections change both counters while the forwarded root stays stable.
+    v2[3 + 12] = 110;
+    v2[3 + 36] = 110;
+    build(anchor + 64 * 1024, false);
+    expectElection(root, phone, 3, 520, followed);
+    checkSync(root, 44, 64, 16);
+
+    timing.clock = nullptr;
+    build(anchor + 64 * 1024, true);
+    expectElection(root, phone, 3, 520, followed);
+    checkSync(root, 4, 64, 16);
+    timing.clock = &clock;
+    build(anchor + ItlAWDL::kPeerScheduleStaleUS, true);
+    expectElection(self, self, 0, 60, standalone);
+    assert(!info.following && info.counter == 1 && info.hops == 0);
+    assert(!memcmp(findTLV(output, length, 20, 6), self, 6));
+
+    v2[3 + 12] = 111;
+    v2[3 + 36] = 111;
+    build(anchor + 3000000, false);
+    expectElection(self, self, 0, 60, standalone);
+
+    // A missing tree falls back to root, peer and self.
+    timing.peer = &legacyPeer;
+    build(anchor + 3072, false);
+    expectElection(root, phone, 3, 520, standalone);
+    resultTree = findTLV(output, length, 20, 18);
+    assert(resultTree && !memcmp(resultTree, root, 6) &&
+           !memcmp(resultTree + 6, phone, 6) && !memcmp(resultTree + 12, self, 6));
+
+    memcpy(peer.tree[1], self, 6);
+    timing.peer = &peer;
+    build(anchor + 3072, false);
+    expectElection(self, self, 0, 60, standalone);
+
+    sync.channels[2] = sync.channels[10] = 44;
+    build(anchor + 3072, false);
+    checkSync(self, 0, 61, 13);
+}
+
 int main()
 {
     const uint8_t ourAddress[] = {2, 3, 4, 5, 6, 7};
+    testElection(ourAddress);
     const uint8_t supplied[] = {
         18, 2, 0, 149, 124,   // Replace Tahoe's multi-channel schedule.
         4, 1, 0, 149,        // Replace Tahoe's sync data.
         6, 5, 0, 0, 0, 0, 1, 0,
         2, 3, 0, 0x12, 0x34, 0x56,
     };
-    uint8_t tlvs[128], frame[256];
+    uint8_t tlvs[256], frame[512];
     size_t length = 0;
     MtkAwdl::ServiceSummary services;
     assert(MtkAwdl::buildAnnouncement(ourAddress, 36, 1, 500000, supplied,
@@ -37,7 +186,7 @@ int main()
         assert(frame[slots + 10 + index * 2] == 115);
     }
     assert(!memcmp(frame + slots + 44, supplied + 9, sizeof(supplied) - 9));
-    assert(length == slots + 44 + sizeof(supplied) - 9);
+    assert(length == slots + 44 + sizeof(supplied) - 9 + 43 + 9);
     for (const uint8_t channel : {uint8_t(6), uint8_t(44), uint8_t(149), uint8_t(165)}) {
         assert(MtkAwdl::buildAnnouncement(ourAddress, channel, 1, 500000, supplied,
             sizeof(supplied), tlvs, sizeof(tlvs), frame, sizeof(frame), &length, &services, true));
@@ -46,6 +195,8 @@ int main()
         for (size_t index = 0; index < 16; ++index) {
             assert(frame[slots + 9 + index * 2] == channel);
             assert(frame[slots + 10 + index * 2] == ItlAWDL::globalOperatingClass20(channel));
+            assert(frame[43 + 39 + index * 2] == ItlAWDL::legacySlotFlags(channel));
+            assert(frame[43 + 40 + index * 2] == channel);
         }
     }
     assert(!MtkAwdl::buildAnnouncement(ourAddress, 52, 1, 500000, supplied,
@@ -115,7 +266,7 @@ int main()
     assert(MtkAwdl::buildAnnouncement(ourAddress, 36, 3, 500000, mi, sizeof(mi),
         tlvs, sizeof(tlvs), frame, sizeof(frame), &length, &services, true));
     assert(frame[30] == 3 && services.records == 1 && services.airDrop);
-    assert(!memcmp(frame + slots + 44, mi, sizeof(mi)));
+    assert(!memcmp(frame + slots + 44, mi + 31, sizeof(mi) - 31));
     assert(!MtkAwdl::inspectMasterIndication(mi, sizeof(mi) - 1, services));
     assert(!MtkAwdl::inspectMasterIndication(mi + 31, sizeof(mi) - 31, services));
     mi[35] = 0;

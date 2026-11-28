@@ -38,7 +38,7 @@
 #include <net80211/ieee80211_var.h>
 
 #ifdef MTK_NATIVE_AWDL
-namespace MtkAwdl { struct AnnouncementCompletions; enum class TxKind : uint8_t; }
+namespace MtkAwdl { struct AnnouncementCompletions; struct PeerTuneRequest; enum class TxKind : uint8_t; }
 #endif
 
 class MtkHalService : public OSObject {
@@ -72,10 +72,12 @@ public:
     /* Periodic hardware state dump / interrupt poll, called on the main work loop. */
     virtual void debugPoll() {}
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-    virtual IOReturn transmitAwdlAnnouncement(const uint8_t *, size_t, MtkAwdl::TxKind, uint8_t) { return kIOReturnUnsupported; }
+    virtual IOReturn transmitAwdlAnnouncement(const uint8_t *, size_t, MtkAwdl::TxKind, uint8_t, bool) { return kIOReturnUnsupported; }
+    virtual void flushAwdlData() {}
     virtual uint8_t getAwdlChannel(bool &allowed) { allowed = false; return 0; }
     virtual bool readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &) { return false; }
     virtual IOReturn setAwdlMacAddress(const uint8_t *, bool) { return kIOReturnUnsupported; }
+    virtual IOReturn tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &) { return kIOReturnUnsupported; }
 #endif
 
     /*

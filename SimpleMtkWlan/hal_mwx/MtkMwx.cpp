@@ -63,6 +63,7 @@ nmx_hide_24ghz_twin(struct ieee80211com *ic, const struct ieee80211_node *node)
 #include <HAL/Awdl/AWDLChannels.hpp>
 void mtkAwdlObserveAction(IOEthernetController *, mbuf_t, uint32_t, int32_t);
 void mtkAwdlObserveData(IOEthernetController *, mbuf_t, uint32_t);
+void mtkAwdlTxCompleted(IOEthernetController *);
 #endif
 #endif
 
@@ -81,6 +82,10 @@ void mtkAwdlObserveData(IOEthernetController *, mbuf_t, uint32_t);
 #include <FwData.h>
 
 #include "if_mwxreg.h"
+
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+#include "MtkMwxAwdlPeer.hpp"
+#endif
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -435,7 +440,7 @@ struct mwx_tx_radiotap_header {
 
 #endif
 
-enum class MwxAwdlTx : uint8_t { None, Sync, Service, VerifiedService, Data, GroupData };
+enum class MwxAwdlTx : uint8_t { None, Sync, Service, VerifiedService, Data, GroupData, BaAction, BaRequest };
 
 struct mwx_txwi {
 	struct mt76_txwi		*mt_desc;
@@ -448,6 +453,8 @@ struct mwx_txwi {
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 	MwxAwdlTx			mt_awdl;
 	uint32_t			mt_awdl_epoch;
+	bool				mt_awdl_peer;
+	bool				mt_awdl_aggregate;
 	uint64_t			mt_awdl_queue_time;
 #endif
 };
@@ -541,8 +548,31 @@ struct mwx_softc {
 	uint32_t sc_awdl_channel_epoch;
 	uint8_t sc_awdl_mac[ETHER_ADDR_LEN];
 	bool sc_awdl_dev_active;
+	bool sc_awdl_want_dev;
+	MwxAwdlPeer::Slot sc_awdl_peer;
+	MtkAwdl::RxReorder<mbuf_t> sc_awdl_reorder[MwxAwdlPeer::rxBaTids];
+	MwxAwdlPeer::ChannelWidth sc_awdl_width, sc_awdl_radio_width;
+	uint8_t sc_awdl_radio_primary;
+	uint8_t sc_awdl_max_bw;
+	struct task sc_awdl_peer_task;
+	struct task sc_awdl_ba_task;
+	bool sc_awdl_ba_enabled;
+	bool sc_awdl_rx_ba_enabled, sc_awdl_fixed_ba;
+	MwxAwdlPeer::WtblProfile sc_awdl_wtbl_profile;
+	MwxAwdlPeer::StationConfig sc_awdl_station_config;
+	uint32_t sc_awdl_tune_gen;
+	uint32_t sc_awdl_txs_sampling;
+	uint8_t sc_awdl_ba_token;
+	uint8_t sc_awdl_peer_requested[IEEE80211_ADDR_LEN];
+	uint8_t sc_awdl_peer_requested_channel;
+	bool sc_awdl_peer_busy;
+	bool sc_awdl_peer_quarantined;
+	uint64_t sc_awdl_peer_retry_us;
+	uint32_t sc_awdl_peer_errors;
+	MwxAwdlPeer::Failure sc_awdl_peer_last_failure;
 	uint8_t sc_awdl_rate_idx;
 	uint8_t sc_awdl_rate_fails;
+	uint8_t sc_awdl_rate_consec_fails;
 	uint16_t sc_awdl_rate_acks;
 	uint16_t sc_awdl_rate_window;
 	uint16_t sc_awdl_rate_hold;
@@ -956,7 +986,18 @@ void		mt7921_mac_set_timing(struct mwx_softc *);
 int		mt7921_mcu_uni_add_dev(struct mwx_softc *, struct mwx_vif *,
 		    struct mwx_node *, int);
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-int		mt7921_mcu_awdl_dev_update(struct mwx_softc *, const uint8_t *, int);
+static uint32_t	mt7921_mcu_awdl_dev_update(struct mwx_softc *, const uint8_t *, int);
+static uint32_t	mwx_awdl_send_command(struct mwx_softc *, uint32_t, void *, size_t);
+static void	mwx_awdl_peer_task(void *);
+static void	mwx_awdl_ba_task(void *);
+static void	mwx_awdl_ba_error(struct mwx_softc *, uint32_t, bool, bool = false);
+static bool	mwx_awdl_ba_rx(struct mwx_softc *, mbuf_t, uint8_t);
+static void	mwx_awdl_rx_deliver(struct mwx_softc *, mbuf_t, uint8_t);
+static bool	mwx_awdl_rx_ba_bar(struct mwx_softc *, mbuf_t, uint8_t);
+static void	mwx_awdl_rx_data(struct mwx_softc *, mbuf_t, uint8_t);
+static int	mwx_awdl_ba_send(struct mwx_softc *, struct ieee80211_node *, const uint8_t *, size_t);
+static int	mwx_awdl_peer_shutdown(struct mwx_softc *, bool, bool);
+static void	mwx_awdl_peer_error(struct mwx_softc *, MwxAwdlPeer::Failure);
 #endif
 int		mt7921_mcu_set_sniffer(struct mwx_softc *, int);
 int		mt7921_mcu_set_beacon_filter(struct mwx_softc *, int);
@@ -1216,18 +1257,47 @@ mwx_init_hw(struct ifnet *ifp)
 	MWX_DEV_LOG(sc, "init add dev ok\n");
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 	sc->sc_awdl_dev_active = false;
+	if (!sc->sc_awdl_tune_gen) {
+		int awdlBa = 1;
+		PE_parse_boot_argn("amtk_awdl_ba", &awdlBa, sizeof(awdlBa));
+		sc->sc_awdl_ba_enabled = awdlBa != 0;
+		int awdlRxBa = 1, awdlFixedBa = 0;
+		PE_parse_boot_argn("amtk_awdl_rx_ba", &awdlRxBa, sizeof(awdlRxBa));
+		PE_parse_boot_argn("amtk_awdl_fixed_ba", &awdlFixedBa, sizeof(awdlFixedBa));
+		sc->sc_awdl_rx_ba_enabled = sc->sc_awdl_ba_enabled && awdlRxBa != 0;
+		sc->sc_awdl_fixed_ba = awdlFixedBa != 0;
+		int awdlWtblProfile = 0;
+		PE_parse_boot_argn("amtk_awdl_wtbl_profile", &awdlWtblProfile, sizeof(awdlWtblProfile));
+		sc->sc_awdl_wtbl_profile = MwxAwdlPeer::wtblProfileFromBootArg(awdlWtblProfile);
+		sc->sc_awdl_station_config = MwxAwdlPeer::stationConfigFromProfile(sc->sc_awdl_wtbl_profile);
+		int awdlCapMask = -1;
+		if (PE_parse_boot_argn("amtk_awdl_cap_mask", &awdlCapMask, sizeof(awdlCapMask)) && awdlCapMask >= 0)
+			sc->sc_awdl_station_config.capMask = uint8_t(awdlCapMask) & MwxAwdlPeer::capMaskAll;
+		int awdlSco = -1;
+		if (PE_parse_boot_argn("amtk_awdl_sco", &awdlSco, sizeof(awdlSco)) && awdlSco >= 0)
+			sc->sc_awdl_station_config.matchingSco = awdlSco != 0;
+		int awdlBw = 80;
+		PE_parse_boot_argn("amtk_awdl_bw", &awdlBw, sizeof(awdlBw));
+		sc->sc_awdl_max_bw = MwxAwdlPeer::sanitizeMaxBw(awdlBw);
+	}
+	sc->sc_awdl_radio_width = {};
+	sc->sc_awdl_radio_primary = 0;
 	sc->sc_awdl_standalone_chan = 0;
 	sc->sc_awdl_rate_idx = 0;
 	sc->sc_awdl_rate_acks = 0;
 	sc->sc_awdl_rate_window = 0;
 	sc->sc_awdl_rate_fails = 0;
+	sc->sc_awdl_rate_consec_fails = 0;
 	sc->sc_awdl_rate_hold = 0;
-	if (mtk_awdl_diagnostics_enabled() &&
+	sc->sc_awdl_completions.txRateIdx = 0;
+	sc->sc_awdl_completions.dataInFlight = 0;
+	if (sc->sc_awdl_want_dev && mtk_awdl_diagnostics_enabled() &&
 	    !IEEE80211_ADDR_EQ(sc->sc_awdl_mac, etheranyaddr) &&
 	    !(sc->sc_awdl_mac[0] & 1)) {
-		int awdl_rv = mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 1);
-		sc->sc_awdl_dev_active = (awdl_rv == 0);
-		MWX_DEV_LOG(sc, "init awdl dev omac=%u rv=%d\n", HW_BSSID_1, awdl_rv);
+		const auto error = mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 1);
+		sc->sc_awdl_dev_active = !error;
+		if (error)
+			mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::DevUpdate, error});
 	}
 #endif
 
@@ -1320,6 +1390,10 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 		task_del(sc->sc_nswq, &sc->sc_edca_task);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+		task_del(sc->sc_nswq, &sc->sc_awdl_peer_task);
+		task_del(sc->sc_nswq, &sc->sc_awdl_ba_task);
+#endif
 	}
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
@@ -1354,6 +1428,12 @@ mwx_stop(struct ifnet *ifp)
 			sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 		}
 
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+		if (mwx_awdl_peer_shutdown(sc, fw_dma_up && !fw_err, true) != 0)
+			fw_err = 1;
+		sc->sc_awdl_standalone_chan = 0;
+#endif
+
 		/*
 		 * Tear down the active BSS and peer STA before disabling the
 		 * device/OMAC; deactivating UNI_BSS_INFO_BASIC while a peer
@@ -1372,13 +1452,6 @@ mwx_stop(struct ifnet *ifp)
 				fw_err = 1;
 		}
 
-#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-		if (fw_dma_up && !fw_err && sc->sc_awdl_dev_active) {
-			(void)mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 0);
-			sc->sc_awdl_dev_active = false;
-		}
-		sc->sc_awdl_standalone_chan = 0;
-#endif
 		mn = &sc->sc_vif.vif_mn;
 		if (fw_dma_up && !fw_err && mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0) != 0)
 			fw_err = 1;
@@ -1659,7 +1732,11 @@ mwx_node_alloc(struct ieee80211com *ic)
 	mn = (struct mwx_node *)malloc(sizeof(struct mwx_node), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (mn == NULL)
 		return NULL;
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	mn->wcid = MwxAwdlPeer::infraNodeWcid(wcid++);
+#else
 	mn->wcid = 1 + wcid++ % (MWX_WTBL_STA - 1);
+#endif
 
 	/* init WCID table entry */
 	mwx_mac_wtbl_update(sc, mn->wcid);
@@ -1784,6 +1861,15 @@ mwx_newstate_task(void *ptr)
 	int s = splnet();
 	int rv = 0;
 
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	if (ostate != nstate && (ostate == IEEE80211_S_RUN ||
+	    nstate == IEEE80211_S_AUTH || nstate == IEEE80211_S_RUN) &&
+	    mwx_awdl_peer_shutdown(sc, sc->sc_fw_loaded && !sc->sc_suspended, false) != 0) {
+		splx(s);
+		return;
+	}
+#endif
+
 	switch (ostate) {
 	case IEEE80211_S_RUN:
 		if (nstate != ostate) {
@@ -1898,9 +1984,19 @@ mwx_newstate_task(void *ptr)
 			    bni->ni_vhtcaps);
 			uint8_t rbw, rcenter;
 			mwx_node_chan_width(bni, &rbw, &rcenter);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+			sc->sc_awdl_radio_width = {};
+			sc->sc_awdl_radio_primary = 0;
+#endif
 			if (rbw != CMD_CBW_20MHZ) {
 				int crv = mt7921_mcu_set_chan_info(sc,
 				    MCU_EXT_CMD_CHANNEL_SWITCH);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+				if (crv == 0) {
+					sc->sc_awdl_radio_width = {rbw, rcenter};
+					sc->sc_awdl_radio_primary = ieee80211_chan2ieee(ic, bni->ni_chan);
+				}
+#endif
 				MWX_DEV_LOG(sc, "RUN switch to %s MHz center=%u rv=%d\n",
 				    rbw == CMD_CBW_160MHZ ? "160" : rbw == CMD_CBW_80MHZ ? "80" : "40", rcenter, crv);
 			}
@@ -2005,6 +2101,22 @@ mwx_bgscan(struct ieee80211com *ic)
 			explicit_ssid = ic->ic_wcl_scan_ssid_length > 0;
 			min_ns = ic->ic_wcl_scan_restricted ? 0ULL :
 			    (10ULL * 1000000000ULL);
+		}
+#endif
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+		const auto &peer = sc->sc_awdl_peer;
+		const uint64_t lastData = max(peer.lastDataAckUS, peer.lastDataRxUS);
+		const uint64_t nowUS = now_ns / 1000;
+		// While an AWDL peer has active unicast traffic, serve wildcard WCL
+		// scans from cache so multi-second off-channel sweeps cannot break
+		// AirDrop. Directed SSID/target scans and recovery sweeps still run.
+		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_cache_ok &&
+		    ic->ic_if.if_link_state == LINK_STATE_UP && sc->sc_ns_state == IEEE80211_S_RUN &&
+		    peer.active &&
+		    (sc->sc_awdl_completions.dataInFlight > 0 ||
+		     (lastData && nowUS >= lastData && nowUS - lastData < 5000000))) {
+			++sc->sc_awdl_completions.bgScanDeferred;
+			return EBUSY;
 		}
 #endif
 		if (!explicit_ssid && mwx_traffic_active(sc, now_ns))
@@ -2258,7 +2370,7 @@ mwx_tx_linearize(struct mbuf *m)
 
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 static uint32_t
-mwx_awdl_rate_val(struct mwx_softc *sc, bool useHt)
+mwx_awdl_rate_val(struct mwx_softc *sc, bool useHt, bool wide = false)
 {
 	int rateKnob = 1;
 	PE_parse_boot_argn("amtk_awdl_rate", &rateKnob, sizeof(rateKnob));
@@ -2267,16 +2379,25 @@ mwx_awdl_rate_val(struct mwx_softc *sc, bool useHt)
 
 	int htKnob = 1;
 	PE_parse_boot_argn("amtk_awdl_ht", &htKnob, sizeof(htKnob));
+	int vhtKnob = 1;
+	PE_parse_boot_argn("amtk_awdl_vht", &vhtKnob, sizeof(vhtKnob));
 	static const uint16_t kRungs[] = {
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 11, /* 6 Mbps */
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 10, /* 12 Mbps */
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 9,  /* 24 Mbps */
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 13, /* 36 Mbps */
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 8,  /* 48 Mbps */
-		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 12, /* 54 Mbps */
-		(MT_PHY_TYPE_HT   << MT_TX_RATE_MODE_SHIFT) | 7,  /* 65 Mbps HT MCS7 */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 11, /* 0:  6 Mbps OFDM */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 10, /* 1: 12 Mbps OFDM */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 9,  /* 2: 24 Mbps OFDM */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 13, /* 3: 36 Mbps OFDM */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 8,  /* 4: 48 Mbps OFDM */
+		(MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 12, /* 5: 54 Mbps OFDM */
+		(MT_PHY_TYPE_HT   << MT_TX_RATE_MODE_SHIFT) | 7,  /* 6: 65 Mbps HT 1SS MCS7 */
+		(MT_PHY_TYPE_VHT  << MT_TX_RATE_MODE_SHIFT) | 8,  /* 7: 78 Mbps VHT 1SS MCS8 */
+		(1U << MT_TX_RATE_NSS_SHIFT) | (MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 5, /* 8: 104 Mbps VHT 2SS MCS5 */
+		(1U << MT_TX_RATE_NSS_SHIFT) | (MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 7, /* 9: 130 Mbps VHT 2SS MCS7 */
+		(1U << MT_TX_RATE_NSS_SHIFT) | (MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 8, /* 10: 156 Mbps VHT 2SS MCS8 */
+		(1U << MT_TX_RATE_NSS_SHIFT) | (MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 9, /* 11: 780 Mbps VHT80 2SS MCS9 */
 	};
-	const uint8_t maxIdx = (useHt && htKnob != 0) ? 6 : 5;
+	uint8_t maxIdx = 5;
+	if (useHt && htKnob != 0)
+		maxIdx = (vhtKnob != 0) ? (wide ? 11 : 10) : 6;
 	uint8_t idx = sc->sc_awdl_rate_idx;
 	if (idx > maxIdx)
 		idx = maxIdx;
@@ -2284,35 +2405,49 @@ mwx_awdl_rate_val(struct mwx_softc *sc, bool useHt)
 }
 
 static void
-mwx_awdl_rate_feedback(struct mwx_softc *sc, bool failed)
+mwx_awdl_rate_feedback(struct mwx_softc *sc, bool failed, bool wide = false)
 {
 	if (!sc)
 		return;
+	const uint8_t maxRung = wide ? 11 : 10;
+	if (sc->sc_awdl_rate_idx > maxRung)
+		sc->sc_awdl_rate_idx = maxRung;
 	if (!failed) {
+		sc->sc_awdl_rate_consec_fails = 0;
 		sc->sc_awdl_rate_acks++;
 		sc->sc_awdl_rate_window++;
-		if (sc->sc_awdl_rate_window >= 128) {
+		if (sc->sc_awdl_rate_window >= 16) {
 			sc->sc_awdl_rate_window = 0;
 			sc->sc_awdl_rate_fails = 0;
 		}
 		if (sc->sc_awdl_rate_hold > 0) {
 			sc->sc_awdl_rate_hold--;
-		} else if (sc->sc_awdl_rate_acks >= 32 && sc->sc_awdl_rate_idx < 6) {
+		} else if (sc->sc_awdl_rate_acks >= 8 && sc->sc_awdl_rate_idx < maxRung) {
 			sc->sc_awdl_rate_idx++;
 			sc->sc_awdl_rate_acks = 0;
 			sc->sc_awdl_rate_fails = 0;
+			sc->sc_awdl_rate_window = 0;
 		}
 	} else {
-		const bool unconfirmed = (sc->sc_awdl_rate_acks < 32);
+		sc->sc_awdl_rate_consec_fails++;
 		sc->sc_awdl_rate_fails++;
+		sc->sc_awdl_rate_window++;
 		sc->sc_awdl_rate_acks = 0;
-		if ((unconfirmed || sc->sc_awdl_rate_fails >= 2) && sc->sc_awdl_rate_idx > 0) {
+		const bool drop = (sc->sc_awdl_rate_consec_fails >= 3) ||
+		    (sc->sc_awdl_rate_fails >= 4);
+		if (drop && sc->sc_awdl_rate_idx > 0) {
 			sc->sc_awdl_rate_idx--;
+			sc->sc_awdl_rate_consec_fails = 0;
 			sc->sc_awdl_rate_fails = 0;
-			sc->sc_awdl_rate_hold = (sc->sc_awdl_rate_hold == 0) ? 256 :
-			    ((sc->sc_awdl_rate_hold < 4096) ? (sc->sc_awdl_rate_hold * 2) : 4096);
+			sc->sc_awdl_rate_window = 0;
+			sc->sc_awdl_rate_hold = (sc->sc_awdl_rate_hold == 0) ? 16 :
+			    ((sc->sc_awdl_rate_hold < 64) ? (sc->sc_awdl_rate_hold * 2) : 64);
+		} else if (sc->sc_awdl_rate_window >= 16) {
+			sc->sc_awdl_rate_window = 0;
+			sc->sc_awdl_rate_fails = 0;
 		}
 	}
+	sc->sc_awdl_completions.txRateIdx = sc->sc_awdl_rate_idx;
 }
 #endif
 
@@ -2341,7 +2476,9 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 	mt7921_mac_write_txwi(sc, m, ni, txp);
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 	mt->mt_awdl = awdlAnnouncement;
-	if (awdlAnnouncement == MwxAwdlTx::VerifiedService)
+	if (awdlAnnouncement == MwxAwdlTx::Data || awdlAnnouncement == MwxAwdlTx::GroupData)
+		++sc->sc_awdl_completions.dataInFlight;
+	if (awdlAnnouncement == MwxAwdlTx::VerifiedService || awdlAnnouncement == MwxAwdlTx::Data)
 		mt->mt_awdl_epoch = sc->sc_awdl_channel_epoch;
 	if (awdlAnnouncement != MwxAwdlTx::None) {
 		const auto *header = mtod(m, const uint8_t *);
@@ -2350,19 +2487,59 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 		uint32_t txd3 = le32toh(txp->txwi[3]);
 		txd3 &= ~(MT_TXD3_REM_TX_COUNT_MASK | MT_TXD3_SEQ | MT_TXD3_PROTECT_FRAME);
 		const bool unicast = (awdlAnnouncement == MwxAwdlTx::Data) && !(header[4] & 1);
+		const bool baAction = awdlAnnouncement == MwxAwdlTx::BaAction ||
+		    awdlAnnouncement == MwxAwdlTx::BaRequest;
+		auto &peer = sc->sc_awdl_peer;
+		const bool dedicated = (unicast || baAction) && sc->sc_awdl_dev_active &&
+		    peer.matches(header + 4, sc->sc_awdl_tx_channel);
+		const bool qosTidZero = unicast && header[0] == 0x88 && mbuf_pkthdr_len(m) >= 26 &&
+		    header[24] == 0 && header[25] == 0;
 		if (unicast) {
 			txd3 &= ~MT_TXD3_NO_ACK;
+			const MwxAwdlPeer::ChannelWidth width = dedicated ? peer.width : MwxAwdlPeer::ChannelWidth{};
+			const uint32_t rateVal = mwx_awdl_rate_val(sc, sc->sc_awdl_tx_channel >= 36,
+			    width.code == CMD_CBW_80MHZ && sc->sc_capa.num_streams >= 2);
+			const uint32_t mode = (rateVal & MT_TX_RATE_MODE_MASK) >> MT_TX_RATE_MODE_SHIFT;
+			txd3 = MwxAwdlPeer::dataBaFlags(txd3, dedicated, peer.ba, qosTidZero, mode, sc->sc_awdl_fixed_ba);
+			if (MwxAwdlPeer::fixedBaRate(txd3, sc->sc_awdl_fixed_ba)) {
+				txp->txwi[2] |= htole32(MT_TXD2_FIX_RATE);
+				txp->txwi[6] = htole32(MwxAwdlPeer::fixedDataRate(rateVal, width));
+			} else {
+				txp->txwi[2] &= ~htole32(MT_TXD2_FIX_RATE);
+				txp->txwi[6] = 0;
+			}
+			txp->txwi[7] &= ~htole32(MT_TXD7_HW_AMSDU);
+			if (!(txd3 & MT_TXD3_BA_DISABLE)) {
+				mt->mt_awdl_aggregate = true;
+				++peer.ba.inFlight;
+				++sc->sc_awdl_completions.peerTxSampleRequests;
+				if ((++sc->sc_awdl_txs_sampling & 15) == 1) {
+					txp->txwi[5] &= ~htole32(MT_TXD5_PID);
+					txp->txwi[5] |= htole32(MT_TXD5_TX_STATUS_HOST | MtkAwdl::awdlTxStatusPid);
+				}
+			}
+		} else if (baAction) {
+			txd3 &= ~(MT_TXD3_NO_ACK | MT_TXD3_SN_VALID);
 			txd3 |= MT_TXD3_BA_DISABLE;
+			constexpr uint32_t rate6Mbps = (MT_PHY_TYPE_OFDM << MT_TX_RATE_MODE_SHIFT) | 11;
 			txp->txwi[2] |= htole32(MT_TXD2_FIX_RATE);
-			const uint32_t rateVal = mwx_awdl_rate_val(sc, sc->sc_awdl_tx_channel >= 36);
 			txp->txwi[6] = htole32(MT_TXD6_FIXED_BW |
-			    ((rateVal << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
+			    ((rate6Mbps << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
 		} else {
 			txd3 |= MT_TXD3_NO_ACK;
 		}
-		txd3 |= MT_TXD3_SN_VALID | (sequence << 16) |
-		    ((unicast ? 3u : 1u) << MT_TXD3_REM_TX_COUNT_SHIFT);
-		uint32_t awdlTxd1 = txd1 | (sc->sc_vif.vif_mn.wcid & MT_TXD1_WLAN_IDX_MASK);
+		// Once BA seeds WTBL, its TID sequence remains authoritative even
+		// when a rate fallback temporarily disables aggregation.
+		txd3 = MwxAwdlPeer::txSequenceFlags(txd3, sequence,
+		    baAction || (dedicated && qosTidZero && peer.ba.hardwareSequence));
+		txd3 |= (unicast || baAction ? 7u : 1u) << MT_TXD3_REM_TX_COUNT_SHIFT;
+		uint16_t wcid = sc->sc_vif.vif_mn.wcid;
+		if (dedicated) {
+			wcid = MwxAwdlPeer::wcid;
+			mt->mt_awdl_peer = true;
+			++sc->sc_awdl_peer.inFlight;
+		}
+		uint32_t awdlTxd1 = txd1 | (wcid & MT_TXD1_WLAN_IDX_MASK);
 		if (sc->sc_awdl_dev_active) {
 			awdlTxd1 = (awdlTxd1 & ~MT_TXD1_OWN_MAC_MASK) |
 			    ((uint32_t(HW_BSSID_1) << MT_TXD1_OWN_MAC_SHIFT) & MT_TXD1_OWN_MAC_MASK);
@@ -2787,13 +2964,21 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		if (mtk_awdl_diagnostics_enabled() && mbuf_len(m) >= sizeof(*wh) &&
 		    (wh->i_fc[0] == 0x08 || wh->i_fc[0] == 0x88) &&
 		    !(wh->i_fc[1] & 3) && !memcmp(wh->i_addr3, awdlBssid, sizeof(awdlBssid))) {
-			mtkAwdlObserveData(sc->sc_awdl_controller, m, rxi.rxi_chan);
+			mwx_awdl_rx_data(sc, m, rxi.rxi_chan);
+			return;
+		}
+		if (mbuf_len(m) >= 20 && wh->i_fc[0] == 0x84 && mwx_awdl_rx_ba_bar(sc, m, rxi.rxi_chan)) {
 			m_freem(m);
 			return;
 		}
-		if ((wh->i_fc[0] & (IEEE80211_FC0_TYPE_MASK | IEEE80211_FC0_SUBTYPE_MASK)) ==
-		    (IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION) &&
-		    mtk_awdl_diagnostics_enabled()) {
+		const bool isAction = mbuf_len(m) >= sizeof(*wh) &&
+		    (wh->i_fc[0] & (IEEE80211_FC0_TYPE_MASK | IEEE80211_FC0_SUBTYPE_MASK)) ==
+		    (IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION);
+		if (isAction && mwx_awdl_ba_rx(sc, m, rxi.rxi_chan)) {
+			m_freem(m);
+			return;
+		}
+		if (isAction && mtk_awdl_diagnostics_enabled()) {
 			static const uint8_t signature[5] = {127, 0x00, 0x17, 0xf2, 8};
 			uint8_t action[7];
 			if (mbuf_pkthdr_len(m) >= sizeof(*wh) + sizeof(action) &&
@@ -3595,6 +3780,10 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_newstate_task, mwx_newstate_task, sc, "mwx_newstate");
 	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task, sc, "mwx_bgscan");
 	task_set(&sc->sc_edca_task, mwx_edca_task, sc, "mwx_edca");
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	task_set(&sc->sc_awdl_peer_task, mwx_awdl_peer_task, sc, "mwx_awdl_peer");
+	task_set(&sc->sc_awdl_ba_task, mwx_awdl_ba_task, sc, "mwx_awdl_ba");
+#endif
 	task_set(&sc->sc_setkey_task, mwx_setkey_task, sc, "mwx_setkey");
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
@@ -4050,6 +4239,20 @@ mwx_txwi_put(struct mwx_softc *sc, struct mwx_txwi *mt)
 	memset(mt->mt_desc, 0, sizeof(*mt->mt_desc));
 	mt->mt_busy = 0;
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	if ((mt->mt_awdl == MwxAwdlTx::Data || mt->mt_awdl == MwxAwdlTx::GroupData) &&
+	    sc->sc_awdl_completions.dataInFlight > 0)
+		--sc->sc_awdl_completions.dataInFlight;
+	if (mt->mt_awdl_aggregate) {
+		mt->mt_awdl_aggregate = false;
+		auto &inFlight = sc->sc_awdl_peer.ba.inFlight;
+		if (inFlight && --inFlight == 0)
+			wakeup(&inFlight);
+	}
+	if (mt->mt_awdl_peer) {
+		mt->mt_awdl_peer = false;
+		if (sc->sc_awdl_peer.inFlight && --sc->sc_awdl_peer.inFlight == 0)
+			wakeup(&sc->sc_awdl_peer.inFlight);
+	}
 	mt->mt_awdl = MwxAwdlTx::None;
 #endif
 
@@ -4732,9 +4935,18 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 			mwx_mac_tx_free(sc, m);
 			break;
 		case PKT_TYPE_TXS:
-#if TODO
-			for (rxd += 2; rxd + 8 <= end; rxd += 8)
-				mt7921_mac_add_txs(dev, rxd);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+			if (sc->sc_awdl_peer.active) {
+				uint32_t report[8];
+				const size_t length = mbuf_pkthdr_len(m);
+				for (size_t offset = 8; offset <= length && length - offset >= sizeof(report);
+				    offset += sizeof(report)) {
+					if (mbuf_copydata(m, offset, sizeof(report), report))
+						break;
+					sc->sc_awdl_completions.peerTxStatus.record(le32toh(report[0]),
+					    le32toh(report[2]), le32toh(report[3]), MwxAwdlPeer::wcid);
+				}
+			}
 #endif
 			m_freem(m);
 			break;
@@ -5212,6 +5424,14 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 		break;
 #endif
 	case MCU_EVENT_COREDUMP:
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+		if (sc->sc_awdl_peer.bssMayExist && !sc->sc_awdl_peer_quarantined) {
+			sc->sc_awdl_peer.active = false;
+			sc->sc_awdl_peer.ba.stop(MtkAwdl::PeerBaState::Failed);
+			sc->sc_awdl_peer_quarantined = true;
+			mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::FirmwareCoredump, EIO});
+		}
+#endif
 		/* Firmware crashed; force WFSYS reset + firmware reload on recovery. */
 		if (!sc->sc_resetting)
 			printf("%s: coredump event\n", DEVNAME(sc));
@@ -5792,6 +6012,13 @@ mwx_init_hardware(struct mwx_softc *sc)
 		goto fail;
 	}
 	MWX_DEV_LOG(sc, "hardware init MCU init ok\n");
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	for (auto &reorder : sc->sc_awdl_reorder)
+		reorder.clear(mbuf_freem);
+	sc->sc_awdl_peer = {};
+	sc->sc_awdl_peer_requested_channel = 0;
+	sc->sc_awdl_dev_active = false;
+#endif
 	/* TODO override eeprom for systems with FDT */
 	rv = mt7921_mcu_set_eeprom(sc);
 	if (rv != 0) {
@@ -7364,7 +7591,7 @@ printf("%s: %s cmd %x wcid %d\n", DEVNAME(sc), __func__, cmd, mn->wcid);
 }
 
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-int
+static uint32_t
 mt7921_mcu_awdl_dev_update(struct mwx_softc *sc, const uint8_t *mac, int enable)
 {
 	struct {
@@ -7393,7 +7620,7 @@ mt7921_mcu_awdl_dev_update(struct mwx_softc *sc, const uint8_t *mac, int enable)
 	};
 	if (mac)
 		memcpy(dev_req.tlv.omac_addr, mac, ETHER_ADDR_LEN);
-	return mwx_mcu_send_wait(sc, MCU_UNI_CMD_DEV_INFO_UPDATE, &dev_req, sizeof(dev_req));
+	return mwx_awdl_send_command(sc, MCU_UNI_CMD_DEV_INFO_UPDATE, &dev_req, sizeof(dev_req));
 }
 #endif
 
@@ -8391,6 +8618,9 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 	uint32_t *txfree;
 	uint32_t txval;
 	int count, i;
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	bool awdlDataReleased = false;
+#endif
 
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
 
@@ -8430,18 +8660,43 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		if (mt->mt_busy == 0)
 			continue;
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-		if (mt->mt_awdl != MwxAwdlTx::None) {
+		if (mt->mt_awdl == MwxAwdlTx::BaRequest) {
+			auto &counts = sc->sc_awdl_completions;
+			const auto status = (txval & MT_TX_FREE_STATUS_MASK) >> 13;
+			counts.peerBaReqAcked += (status == 0);
+			counts.peerBaReqFailed += (status != 0);
+		} else if (mt->mt_awdl != MwxAwdlTx::None && mt->mt_awdl != MwxAwdlTx::BaAction) {
 			auto &counts = sc->sc_awdl_completions;
 			const auto status = (txval & MT_TX_FREE_STATUS_MASK) >> 13;
 			const bool verified = mt->mt_awdl == MwxAwdlTx::VerifiedService;
 			const bool service = verified || mt->mt_awdl == MwxAwdlTx::Service;
 			counts.lastStatus = status;
 			if (mt->mt_awdl == MwxAwdlTx::Data || mt->mt_awdl == MwxAwdlTx::GroupData) {
+				awdlDataReleased = true;
 				counts.dataSent += (status == 0);
-				counts.unicastReportedSent += (status == 0 && mt->mt_awdl == MwxAwdlTx::Data);
 				counts.dataFailed += (status != 0);
-				if (mt->mt_awdl == MwxAwdlTx::Data)
-					mwx_awdl_rate_feedback(sc, status != 0);
+				if (mt->mt_awdl == MwxAwdlTx::Data) {
+					if (mt->mt_awdl_aggregate) {
+						counts.peerAggTxSent += status == 0;
+						counts.peerAggTxFailed += status != 0;
+						counts.peerAggLastStatus = status;
+					}
+					counts.unicastReportedSent += (status == 0);
+					if (!status && mt->mt_awdl_epoch == sc->sc_awdl_channel_epoch &&
+					    mt->mt_mbuf && mbuf_len(mt->mt_mbuf) >= 10) {
+						const auto *destination = mtod(mt->mt_mbuf, const uint8_t *) + 4;
+						const auto now = mwx_now_us();
+						counts.unicastAcks.note(destination, now);
+						if (mt->mt_awdl_peer && sc->sc_awdl_peer.active &&
+						    !memcmp(destination, sc->sc_awdl_peer.mac, 6))
+							sc->sc_awdl_peer.lastDataAckUS = now;
+					}
+					counts.unicastReportedFailed += (status != 0);
+					if (status != 0)
+						counts.unicastLastFailStatus = status;
+					mwx_awdl_rate_feedback(sc, status != 0, mt->mt_awdl_peer &&
+					    sc->sc_awdl_completions.peerBw == 80 && sc->sc_capa.num_streams >= 2);
+				}
 			} else if (status == 0) {
 				if (verified && mt->mt_awdl_epoch == sc->sc_awdl_channel_epoch) {
 					++counts.verifiedServiceSent;
@@ -8466,6 +8721,10 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 out:
 	m_freem(m);
 	mwx_tx_kick(sc);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+	if (awdlDataReleased)
+		mtkAwdlTxCompleted(sc->sc_awdl_controller);
+#endif
 }
 
 int
@@ -9133,7 +9392,14 @@ MtkMwx::detach(IOPCIDevice *device)
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
-    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    if (ifp->if_flags & IFF_RUNNING) {
+        mwx_stop(ifp);
+    }
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+    else {
+        (void)mwx_awdl_peer_shutdown(com, com->sc_fw_loaded && !com->sc_suspended, true);
+    }
+#endif
     timeout_free(&com->sc_reset_to);
     timeout_free(&com->sc_dma_to);
     timeout_free(&com->sc_intr_to);
@@ -9147,6 +9413,13 @@ MtkMwx::detach(IOPCIDevice *device)
     if (com->sc_memh) {
         mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
         mwx_dma_disable(com, 1);
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+        if (com->sc_awdl_peer.bssMayExist && !com->sc_suspended) {
+            const int error = mwx_ensure_drv_own(com, "AWDL detach");
+            if (error || mwx_wfsys_reset(com) != 0)
+                MWX_LOG("HAL detach: AWDL firmware reset failed\n");
+        }
+#endif
     }
     if (com->sc_net_attached) {
         ieee80211_ifdetach(ifp);
@@ -9406,16 +9679,29 @@ MtkMwx::free()
 		MtkHalService::free();
 	}
 
-static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len)
+static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len,
+    uint32_t *firmwareStatus = nullptr)
 {
     int seq, rv;
     uint32_t status = 0;
     rv = mwx_mcu_send_msg(sc, cmd, data, len, &seq);
     if (rv) return rv;
     rv = mwx_mcu_wait_resp_int(sc, cmd, seq, &status);
+    if (!rv && firmwareStatus)
+        *firmwareStatus = status;
     MWX_DEV_LOG(sc, "assoc_status cmd=%x transport=%d firmware=%u\n", cmd, rv, status);
     return rv ? rv : (status ? EIO : 0);
 }
+
+#if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+static uint32_t
+mwx_awdl_send_command(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len)
+{
+	uint32_t status = 0;
+	const int error = mwx_send_assoc_status(sc, cmd, data, len, &status);
+	return status ? status : uint32_t(error);
+}
+#endif
 
 /*
  * HE STA TLV construction (yy_he_*, mwx_yy_sta_he_tlv) adapted from YYavicWiFi
@@ -10241,6 +10527,673 @@ MtkMwx::resume()
 }
 
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+// Peer MCU requests run off the packet submission path. The workloop gate
+// protects the slot and TXWI accounting, and the busy flag spans MCU sleeps.
+static bool
+mwx_awdl_peer_radio_ready(struct mwx_softc *sc)
+{
+	return sc->sc_fw_loaded && sc->sc_memh && !sc->sc_suspended;
+}
+
+struct MwxAwdlPeerFirmware {
+	struct mwx_softc *sc;
+
+	bool canInstall(uint8_t channel) const {
+		return mwx_awdl_peer_radio_ready(sc) && sc->sc_awdl_dev_active &&
+		    !sc->sc_detaching && !sc->sc_resetting && !sc->sc_hard_reset &&
+		    !sc->sc_awdl_peer_quarantined && sc->sc_awdl_want_dev &&
+		    channel == sc->sc_awdl_tx_channel &&
+		    (sc->sc_ic.ic_if.if_flags & IFF_RUNNING) &&
+		    sc->sc_ns_state == sc->sc_ic.ic_state &&
+		    !(sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN));
+	}
+
+	uint32_t drain(uint32_t &inFlight) const {
+		for (unsigned attempt = 0; inFlight && attempt < 25; ++attempt)
+			tsleep_nsec(&inFlight, 0, "awdlpeerdrain", MSEC_TO_NSEC(10));
+		return inFlight ? ETIMEDOUT : 0;
+	}
+
+	uint32_t station(const uint8_t *mac, uint8_t channel, MwxAwdlPeer::StationUpdate update, MwxAwdlPeer::ChannelWidth width = {}) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		uint8_t request[MwxAwdlPeer::staRequestMax];
+		const size_t len = MwxAwdlPeer::buildStationRequest(request, mac, channel,
+		    sc->sc_capa.num_streams >= 2, update, width, sc->sc_awdl_station_config);
+		return mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, request, len);
+	}
+
+	uint32_t bss(const uint8_t *mac, uint8_t channel, bool enable) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		auto request = MwxAwdlPeer::makeBssRequest(mac, channel, sc->sc_vif.wmm_idx, enable);
+		return mwx_awdl_send_command(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &request, sizeof(request));
+	}
+
+	uint32_t rlm(uint8_t channel, MwxAwdlPeer::ChannelWidth width) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		auto request = MwxAwdlPeer::makeRlmRequest(channel,
+		    sc->sc_capa.num_streams, sc->sc_capa.antenna_mask, width, sc->sc_awdl_station_config);
+		return mwx_awdl_send_command(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &request, sizeof(request));
+	}
+	uint32_t programBa(MwxAwdlPeer::TxBa &ba, bool enable) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		auto wtbl = MwxAwdlPeer::makeWtblBa(ba.ssn, ba.window, enable);
+		auto sta = MwxAwdlPeer::makeStaBa(ba.ssn, ba.window, enable);
+		const auto wtblError = mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE,
+		    &wtbl, sizeof(wtbl));
+		if (wtblError)
+			return wtblError;
+		if (enable && (!ba.accepted() || !sc->sc_awdl_peer.active ||
+		    !canInstall(sc->sc_awdl_peer.channel)))
+			return ECANCELED;
+		return mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, &sta, sizeof(sta));
+	}
+
+	uint32_t clearBa(MwxAwdlPeer::TxBa &ba) const {
+		const auto error = programBa(ba, false);
+		if (!error) {
+			ba.firmwareMayExist = false;
+			if (ba.hardwareSequence) {
+				ba.hardwareSequence = false;
+				ba.nextSequence = (ba.nextSequence + MtkAwdl::baWindow) & 0xfff;
+			}
+		}
+		return error;
+	}
+
+	uint32_t programRxBa(MwxAwdlPeer::RxBa &ba, const uint8_t *mac, bool enable) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		auto wtbl = MwxAwdlPeer::makeWtblBa(ba.ssn, ba.window, enable, ba.tid, mac);
+		auto sta = MwxAwdlPeer::makeStaBa(ba.ssn, ba.window, enable, ba.tid, true);
+		// Recipient WTBL_BA resets the peer/TID scoreboard. Disable STA
+		// reception before resetting it during teardown.
+		if (!enable) {
+			const auto error = mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, &sta, sizeof(sta));
+			if (error)
+				return error;
+			return mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, &wtbl, sizeof(wtbl));
+		}
+		const auto error = mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, &wtbl, sizeof(wtbl));
+		if (error) {
+			if (error == 0xc00000bbU || error == EOPNOTSUPP) {
+				// Explicit unsupported reply to the first command. No RX STA
+				// agreement was installed and this WCID can still carry data.
+				ba.firmwareMayExist = false;
+				ba.unsupported = true;
+			}
+			return error;
+		}
+		if (ba.stopping || !sc->sc_awdl_peer.active || !canInstall(sc->sc_awdl_peer.channel))
+			return ECANCELED;
+		return mwx_awdl_send_command(sc, MCU_UNI_CMD_STA_REC_UPDATE, &sta, sizeof(sta));
+	}
+
+	void finishRxBa(uint8_t tid, uint8_t channel) const {
+		auto *device = sc;
+		sc->sc_awdl_reorder[tid].finish([device, channel](mbuf_t packet) {
+			mwx_awdl_rx_deliver(device, packet, channel);
+		});
+	}
+
+	uint32_t clearRxBa(MwxAwdlPeer::RxBa &ba, const uint8_t *mac) const {
+		ba.active = false;
+		sc->sc_awdl_reorder[ba.tid].clear(mbuf_freem);
+		const auto error = programRxBa(ba, mac, false);
+		if (!error)
+			ba.firmwareMayExist = false;
+		return error;
+	}
+
+};
+
+static void
+mwx_awdl_peer_unlock(struct mwx_softc *sc)
+{
+	sc->sc_awdl_peer_busy = false;
+	wakeup(&sc->sc_awdl_peer_busy);
+}
+
+static void
+mwx_awdl_peer_error(struct mwx_softc *sc, MwxAwdlPeer::Failure failure)
+{
+	if (failure.step == MwxAwdlPeer::FailStep::BaRemove)
+		mwx_awdl_ba_error(sc, failure.code, false);
+	++sc->sc_awdl_peer_errors;
+	sc->sc_awdl_peer_retry_us = mwx_now_us() + 5000000;
+	const auto previous = sc->sc_awdl_peer_last_failure;
+	if (previous.step != failure.step || previous.code != failure.code)
+		IOLog("MTK AWDL: peer WCID %u step=%u err=%d\n",
+		    unsigned(MwxAwdlPeer::wcid), unsigned(failure.step), int32_t(failure.code));
+	sc->sc_awdl_peer_last_failure = failure;
+}
+
+static void
+mwx_awdl_peer_quarantine(struct mwx_softc *sc)
+{
+	sc->sc_awdl_peer_quarantined = true;
+	sc->sc_hard_reset = 1;
+	if (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)
+		mwx_reset(sc);
+}
+
+static void
+mwx_awdl_request_peer(struct mwx_softc *sc, const uint8_t *mac, uint8_t channel)
+{
+	MwxAwdlPeerFirmware firmware{sc};
+	const uint64_t nowUS = mwx_now_us();
+	if (sc->sc_awdl_peer_busy || !firmware.canInstall(channel) ||
+	    sc->sc_awdl_peer.matches(mac, channel) ||
+	    sc->sc_awdl_peer.stickyForOtherPeer(channel, nowUS) ||
+	    nowUS < sc->sc_awdl_peer_retry_us ||
+	    !MwxAwdlPeer::validPeerMac(mac) || IEEE80211_ADDR_EQ(mac, sc->sc_awdl_mac))
+		return;
+
+	const auto *ap = sc->sc_ic.ic_state == IEEE80211_S_RUN ? sc->sc_ic.ic_bss : nullptr;
+	const auto &vif = sc->sc_vif;
+	const uint16_t apWcid = ap ? reinterpret_cast<const struct mwx_node *>(ap)->wcid : 0;
+	const bool sameMac = ap && IEEE80211_ADDR_EQ(mac, ap->ni_macaddr);
+	if (MwxAwdlPeer::slotConflict(vif.idx, vif.omac_idx, vif.vif_mn.wcid, apWcid) || sameMac) {
+		const auto previous = sc->sc_awdl_peer_last_failure;
+		if (previous.step != MwxAwdlPeer::FailStep::GuardConflict || previous.code != EBUSY)
+			IOLog("MTK AWDL: peer guard bss=%u omac=%u vif_wcid=%u ap_wcid=%u same_mac=%u\n",
+			    unsigned(vif.idx), unsigned(vif.omac_idx), unsigned(vif.vif_mn.wcid),
+			    unsigned(apWcid), unsigned(sameMac));
+		mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::GuardConflict, EBUSY});
+		return;
+	}
+	memcpy(sc->sc_awdl_peer_requested, mac, IEEE80211_ADDR_LEN);
+	sc->sc_awdl_peer_requested_channel = channel;
+	task_add(sc->sc_nswq, &sc->sc_awdl_peer_task);
+}
+
+static void
+mwx_awdl_peer_task(void *arg)
+{
+	auto *sc = static_cast<struct mwx_softc *>(arg);
+	auto *ih = static_cast<pci_intr_handle_t>(sc->sc_ih);
+	if (!ih || !ih->workloop)
+		return;
+	ih->workloop->runAction([](OSObject *, void *arg, void *, void *, void *) -> IOReturn {
+		auto *sc = static_cast<struct mwx_softc *>(arg);
+		if (sc->sc_awdl_peer_busy || sc->sc_detaching || sc->sc_resetting ||
+		    !mwx_awdl_peer_radio_ready(sc))
+			return kIOReturnSuccess;
+		const auto channel = sc->sc_awdl_peer_requested_channel;
+		uint8_t mac[IEEE80211_ADDR_LEN];
+		memcpy(mac, sc->sc_awdl_peer_requested, sizeof(mac));
+		sc->sc_awdl_peer_requested_channel = 0;
+		auto &slot = sc->sc_awdl_peer;
+		if (channel && slot.matches(mac, channel))
+			return kIOReturnSuccess;
+
+		sc->sc_awdl_peer_busy = true;
+		MwxAwdlPeerFirmware firmware{sc};
+		auto failure = slot.replace(firmware, mac, channel, sc->sc_awdl_width);
+		if (failure.step == MwxAwdlPeer::FailStep::BssRlm &&
+		    slot.width.code != CMD_CBW_20MHZ && firmware.canInstall(channel)) {
+			IOLog("MTK AWDL: wide RLM failed (0x%x); trying 20 MHz\n", failure.code);
+			failure = slot.replace(firmware, mac, channel, {CMD_CBW_20MHZ, channel});
+		}
+		sc->sc_awdl_completions.peerBw = slot.active ? slot.width.mhz() : 20;
+		if (failure)
+			mwx_awdl_peer_error(sc, failure);
+		if (!slot.active && slot.bssMayExist) {
+			// Keep ownership until cleanup or hardware reset is confirmed.
+			if (sc->sc_resetting) {
+				mwx_awdl_peer_quarantine(sc);
+			} else if (const auto cleanup = slot.remove(firmware)) {
+				mwx_awdl_peer_error(sc, cleanup);
+				mwx_awdl_peer_quarantine(sc);
+			}
+		}
+		mwx_awdl_peer_unlock(sc);
+		return kIOReturnSuccess;
+	}, ih, sc);
+}
+
+static int
+mwx_awdl_peer_shutdown(struct mwx_softc *sc, bool firmwareReady, bool disableDevice)
+{
+	auto *ih = static_cast<pci_intr_handle_t>(sc->sc_ih);
+	if (!ih || !ih->workloop)
+		return sc->sc_awdl_peer.bssMayExist ? EIO : 0;
+	struct Args {
+		bool firmwareReady, disableDevice;
+		int error;
+	} args{firmwareReady, disableDevice, 0};
+	ih->workloop->runAction([](OSObject *, void *arg, void *options, void *, void *) -> IOReturn {
+		auto *sc = static_cast<struct mwx_softc *>(arg);
+		auto &args = *static_cast<Args *>(options);
+		sc->sc_awdl_peer_requested_channel = 0;
+		for (unsigned attempt = 0; sc->sc_awdl_peer_busy && attempt < 350; ++attempt)
+			tsleep_nsec(&sc->sc_awdl_peer_busy, 0, "awdlpeerstop", MSEC_TO_NSEC(10));
+		if (sc->sc_awdl_peer_busy) {
+			args.error = ETIMEDOUT;
+			mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::StaRemove, ETIMEDOUT});
+			mwx_awdl_peer_quarantine(sc);
+			return kIOReturnSuccess;
+		}
+		sc->sc_awdl_peer_busy = true;
+		sc->sc_awdl_peer_requested_channel = 0;
+		auto &slot = sc->sc_awdl_peer;
+		slot.active = false;
+		slot.ba.stop(MtkAwdl::PeerBaState::Idle);
+		slot.stopRxBa();
+		const bool ready = args.firmwareReady && mwx_awdl_peer_radio_ready(sc);
+		MwxAwdlPeerFirmware firmware{sc};
+		if (!ready)
+			for (uint8_t tid = 0; tid < MwxAwdlPeer::rxBaTids; ++tid)
+				firmware.finishRxBa(tid, slot.channel);
+		using MwxAwdlPeer::FailStep;
+		MwxAwdlPeer::Failure failure;
+		if (slot.bssMayExist)
+			failure = ready ? slot.remove(firmware) :
+			    MwxAwdlPeer::Failure{slot.staMayExist ? FailStep::StaRemove : FailStep::BssRemove, EIO};
+		if (!failure && args.disableDevice && sc->sc_awdl_dev_active) {
+			const uint32_t error = ready ? mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 0) : EIO;
+			if (error)
+				failure = {FailStep::DevUpdate, error};
+			else
+				sc->sc_awdl_dev_active = false;
+		}
+		if (failure) {
+			args.error = EIO;
+			mwx_awdl_peer_error(sc, failure);
+			mwx_awdl_peer_quarantine(sc);
+		}
+		mwx_awdl_peer_unlock(sc);
+		return kIOReturnSuccess;
+	}, ih, sc, &args);
+	return args.error;
+}
+
+static void
+mwx_awdl_ba_error(struct mwx_softc *sc, uint32_t error, bool notify, bool retry)
+{
+	auto &ba = sc->sc_awdl_peer.ba;
+	ba.stop(MtkAwdl::PeerBaState::Failed, notify);
+	ba.retryAllowed = retry;
+	if (retry)
+		ba.nextRequestUS = mwx_now_us() + MwxAwdlPeer::TxBa::retryUS;
+	auto &counts = sc->sc_awdl_completions;
+	++counts.peerBaErrors;
+	counts.peerBaLastError = error;
+	IOLog("MTK AWDL: peer WCID %u TX BA error=0x%x\n", unsigned(MwxAwdlPeer::wcid), error);
+}
+
+static void
+mwx_awdl_ba_expire(struct mwx_softc *sc, uint64_t now)
+{
+	if (sc->sc_awdl_peer.ba.expired(now))
+		mwx_awdl_ba_error(sc, ETIMEDOUT, true, true);
+}
+
+static void
+mwx_awdl_rx_ba_service(struct mwx_softc *sc, const MwxAwdlPeerFirmware &firmware, uint8_t tid)
+{
+	auto &peer = sc->sc_awdl_peer;
+	auto &ba = peer.rxBa[tid];
+	auto &reorder = sc->sc_awdl_reorder[tid];
+	const auto deliver = [sc, &peer](mbuf_t packet) { mwx_awdl_rx_deliver(sc, packet, peer.channel); };
+	if (ba.stopping) {
+		reorder.finish(deliver);
+		const uint32_t error = ba.firmwareMayExist ? firmware.clearRxBa(ba, peer.mac) : 0;
+		if (error) {
+			mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::BaRemove, error});
+			mwx_awdl_peer_quarantine(sc);
+			return;
+		}
+		ba.stopping = false;
+	}
+	if (!ba.pending || !peer.active || !firmware.canInstall(peer.channel))
+		return;
+
+	auto request = ba.pendingRequest;
+	ba.pending = false;
+	constexpr uint16_t declined = 37;
+	uint16_t status = declined;
+	if (sc->sc_awdl_rx_ba_enabled && !ba.unsupported && request.immediate) {
+		const bool existing = ba.matchesDuplicate(request, reorder.head, mwx_now_us());
+		if (existing) {
+			request.window = ba.window;
+			status = 0;
+		} else {
+			if (ba.active) {
+				++sc->sc_awdl_completions.peerBaRxReconfigs;
+				reorder.finish(deliver);
+			}
+			uint32_t error = ba.firmwareMayExist ? firmware.clearRxBa(ba, peer.mac) : 0;
+			if (error) {
+				mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::BaRemove, error});
+				mwx_awdl_peer_quarantine(sc);
+				return;
+			}
+			if (ba.stopping || !peer.active || !firmware.canInstall(peer.channel))
+				return;
+			ba.tid = request.tid;
+			ba.ssn = request.ssn;
+			ba.window = request.window;
+			ba.token = request.token;
+			ba.firmwareMayExist = true;
+			error = firmware.programRxBa(ba, peer.mac, true);
+			if (!error && !ba.stopping && peer.active && firmware.canInstall(peer.channel)) {
+				status = 0;
+				ba.setupUS = mwx_now_us();
+				reorder.head = ba.ssn;
+				reorder.window = ba.window;
+			} else {
+				if (error && error != ECANCELED)
+					IOLog("MTK AWDL: RX BA setup tid=%u error=0x%x\n", ba.tid, error);
+				const auto cleanup = !ba.firmwareMayExist ? 0 : sc->sc_resetting ? uint32_t(ECANCELED) :
+				    firmware.clearRxBa(ba, peer.mac);
+				if (cleanup) {
+					mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::BaRemove, cleanup});
+					mwx_awdl_peer_quarantine(sc);
+					return;
+				}
+			}
+		}
+	}
+	if (ba.stopping || !peer.active || !firmware.canInstall(peer.channel))
+		return;
+	if (status) {
+		++sc->sc_awdl_completions.peerBaRxRejected;
+		++sc->sc_awdl_completions.peerBaRxRejectResponder;
+	}
+	auto *node = sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_ic.ic_bss ?
+	    sc->sc_ic.ic_bss : &sc->sc_vif.vif_mn.ni;
+	uint8_t response[MtkAwdl::baRequestLength];
+	MtkAwdl::buildBaResponse(response, sc->sc_awdl_mac, peer.mac, request, status);
+	if (mwx_awdl_ba_send(sc, node, response, sizeof(response)) == 0 && !status) {
+		++sc->sc_awdl_completions.peerBaRxRespSent;
+		if (!ba.active)
+			IOLog("MTK AWDL: RX BA active tid=%u window=%u ssn=%u\n", ba.tid, ba.window, ba.ssn);
+		ba.active = true;
+	}
+}
+
+static void
+mwx_awdl_rx_deliver(struct mwx_softc *sc, mbuf_t packet, uint8_t channel)
+{
+	mtkAwdlObserveData(sc->sc_awdl_controller, packet, channel);
+	mbuf_freem(packet);
+}
+
+static void
+mwx_awdl_rx_data(struct mwx_softc *sc, mbuf_t packet, uint8_t channel)
+{
+	auto &peer = sc->sc_awdl_peer;
+	const auto *frame = mtod(packet, const uint8_t *);
+	const bool unicast = peer.matches(frame + 10, channel) && !(frame[1] & 0xc4) &&
+	    !(frame[22] & 0xf) && !memcmp(frame + 4, sc->sc_awdl_mac, ETHER_ADDR_LEN);
+	if (unicast)
+		peer.lastDataRxUS = mwx_now_us();
+	if (unicast && frame[0] == 0x88 && mbuf_len(packet) >= 26) {
+		const uint8_t tid = frame[24] & 0x0f;
+		if (tid < MwxAwdlPeer::rxBaTids && peer.rxBa[tid].active) {
+			sc->sc_awdl_reorder[tid].receive(packet, ItlAWDL::read16(frame + 22) >> 4, mwx_now_us(),
+			    [sc, channel](mbuf_t m) { mwx_awdl_rx_deliver(sc, m, channel); }, mbuf_freem);
+			return;
+		}
+	}
+	mwx_awdl_rx_deliver(sc, packet, channel);
+}
+
+static bool
+mwx_awdl_rx_ba_bar(struct mwx_softc *sc, mbuf_t packet, uint8_t channel)
+{
+	const auto *frame = mtod(packet, const uint8_t *);
+	auto &peer = sc->sc_awdl_peer;
+	if (!peer.matches(frame + 10, channel) || memcmp(frame + 4, sc->sc_awdl_mac, ETHER_ADDR_LEN))
+		return false;
+	uint8_t tid;
+	uint16_t ssn;
+	if (MtkAwdl::parseBar(frame, mbuf_len(packet), tid, ssn) && tid < MwxAwdlPeer::rxBaTids &&
+	    peer.rxBa[tid].active)
+		sc->sc_awdl_reorder[tid].bar(ssn, mwx_now_us(),
+		    [sc, channel](mbuf_t m) { mwx_awdl_rx_deliver(sc, m, channel); });
+	return true;
+}
+
+static void
+mwx_awdl_ba_task(void *arg)
+{
+	auto *sc = static_cast<struct mwx_softc *>(arg);
+	auto *ih = static_cast<pci_intr_handle_t>(sc->sc_ih);
+	if (!ih || !ih->workloop)
+		return;
+	ih->workloop->runAction([](OSObject *, void *arg, void *, void *, void *) -> IOReturn {
+		auto *sc = static_cast<struct mwx_softc *>(arg);
+		if (sc->sc_awdl_peer_busy || sc->sc_detaching || sc->sc_resetting ||
+		    !mwx_awdl_peer_radio_ready(sc))
+			return kIOReturnSuccess;
+		auto &peer = sc->sc_awdl_peer;
+		auto &ba = peer.ba;
+		MwxAwdlPeerFirmware firmware{sc};
+		mwx_awdl_ba_expire(sc, mwx_now_us());
+		sc->sc_awdl_peer_busy = true;
+		while (peer.active && ba.holdData() && peer.inFlight &&
+		    firmware.canInstall(peer.channel) && !ba.expired(mwx_now_us()))
+			tsleep_nsec(&peer.inFlight, 0, "awdlbadrain", MSEC_TO_NSEC(1));
+		mwx_awdl_ba_expire(sc, mwx_now_us());
+		if (peer.active && ba.holdData() && !peer.inFlight && firmware.canInstall(peer.channel)) {
+			// From here non-QoS traffic can resume while MCU commands complete.
+			ba.firmwareMayExist = true;
+			const auto error = firmware.programBa(ba, true);
+			if (error && error != ECANCELED) {
+				mwx_awdl_ba_error(sc, error, ba.requested());
+			} else if (!error && peer.active && firmware.canInstall(peer.channel) && ba.activate(error)) {
+				IOLog("MTK AWDL: peer WCID %u TX BA active tid=0 window=%u ssn=%u\n",
+				    unsigned(MwxAwdlPeer::wcid), unsigned(ba.window), unsigned(ba.ssn));
+			} else if (ba.requested()) {
+				mwx_awdl_ba_error(sc, ECANCELED, true);
+			}
+		}
+		if (!ba.active() && ba.firmwareMayExist) {
+			if (sc->sc_resetting) {
+				mwx_awdl_peer_quarantine(sc);
+			} else {
+				uint32_t error = firmware.drain(ba.inFlight);
+				if (!error)
+					error = firmware.clearBa(ba);
+				if (error) {
+					mwx_awdl_ba_error(sc, error, false);
+					mwx_awdl_peer_quarantine(sc);
+				}
+			}
+		}
+		for (uint8_t tid = 0; tid < MwxAwdlPeer::rxBaTids && peer.active &&
+		    !sc->sc_resetting && !sc->sc_awdl_peer_quarantined; ++tid)
+			mwx_awdl_rx_ba_service(sc, firmware, tid);
+		mwx_awdl_peer_unlock(sc);
+		return kIOReturnSuccess;
+	}, ih, sc);
+}
+
+static bool
+mwx_awdl_ba_rx(struct mwx_softc *sc, mbuf_t packet, uint8_t channel)
+{
+	uint8_t frame[MtkAwdl::baRequestLength];
+	const size_t length = min(mbuf_pkthdr_len(packet), sizeof(frame));
+	if (!sc->sc_awdl_dev_active || length < 25 ||
+	    mbuf_copydata(packet, 0, length, frame) || frame[24] != MtkAwdl::baCategory)
+		return false;
+
+	auto &counts = sc->sc_awdl_completions;
+	++counts.peerBaRxAny;
+	if (memcmp(frame + 4, sc->sc_awdl_mac, ETHER_ADDR_LEN))
+		return false;
+
+	const bool isRequest = length >= 26 && frame[25] == MtkAwdl::baRequest;
+	counts.peerBaRxReq += isRequest;
+	auto &peer = sc->sc_awdl_peer;
+	MtkAwdl::BaResponse response;
+	const bool hasResponse = MtkAwdl::parseBaResponse(frame, length, response);
+	if (hasResponse)
+		counts.peerBaRxLastStatus = response.status;
+
+	if (!peer.active || channel != peer.channel || channel != sc->sc_awdl_tx_channel ||
+	    !MtkAwdl::isPeerBaAction(frame, length, sc->sc_awdl_mac, peer.mac)) {
+		++counts.peerBaRxRejected;
+		++counts.peerBaRxRejectFilter;
+		if (hasResponse)
+			IOLog("MTK AWDL: ADDBA response rejected channel=%u BSSID=%02x:%02x:%02x:%02x:%02x:%02x\n",
+			    channel, frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
+		return true;
+	}
+
+	auto &ba = peer.ba;
+	const auto now = mwx_now_us();
+	mwx_awdl_ba_expire(sc, now);
+	MtkAwdl::BaRequest request;
+	uint8_t rxTid = 0;
+	uint16_t reason = 0;
+	if (MtkAwdl::parseBaRequest(frame, length, request)) {
+		counts.peerBaRxTidMask |= 1u << request.tid;
+		if (request.tid >= MwxAwdlPeer::rxBaTids) {
+			++counts.peerBaRxOtherTid;
+			++counts.peerBaRxRejected;
+			++counts.peerBaRxRejectFilter;
+			return true;
+		}
+		auto &session = peer.rxBa[request.tid];
+		session.pendingRequest = request;
+		session.pending = true;
+		task_add(sc->sc_nswq, &sc->sc_awdl_ba_task);
+	} else if (MtkAwdl::parseOriginatorDelba(frame, length, rxTid) && rxTid < MwxAwdlPeer::rxBaTids &&
+	    (peer.rxBa[rxTid].firmwareMayExist || peer.rxBa[rxTid].pending)) {
+		auto &session = peer.rxBa[rxTid];
+		session.active = session.pending = false;
+		session.stopping = true;
+		task_add(sc->sc_nswq, &sc->sc_awdl_ba_task);
+	} else if (hasResponse && ba.requested() && !ba.accepted() && response.token == ba.token &&
+	    !(response.parameters & MtkAwdl::baTidMask)) {
+		if (ba.accept(response, now)) {
+			++counts.peerBaRespOk;
+			task_add(sc->sc_nswq, &sc->sc_awdl_ba_task);
+		} else if (response.status) {
+			mwx_awdl_ba_error(sc, response.status, false);
+		} else {
+			++counts.peerBaRxRejected;
+			++counts.peerBaRxRejectFilter;
+		}
+	} else if (MtkAwdl::parseRecipientDelba(frame, length, reason) &&
+	    (ba.requested() || ba.active())) {
+		ba.onRecipientDelba(now);
+		++counts.peerBaDelba;
+		IOLog("MTK AWDL: peer WCID %u TX BA DELBA reason=%u (re-arming)\n",
+		    unsigned(MwxAwdlPeer::wcid), unsigned(reason));
+		task_add(sc->sc_nswq, &sc->sc_awdl_ba_task);
+	} else {
+		++counts.peerBaRxRejected;
+		++counts.peerBaRxRejectFilter;
+	}
+	return true;
+}
+
+static int
+mwx_awdl_ba_send(struct mwx_softc *sc, struct ieee80211_node *node,
+    const uint8_t *frame, size_t length)
+{
+	mbuf_t packet = nullptr;
+	if (mbuf_getpacket(MBUF_DONTWAIT, &packet) || !packet)
+		return ENOMEM;
+	if (mbuf_maxlen(packet) < length) {
+		mbuf_freem(packet);
+		return ENOBUFS;
+	}
+	memcpy(mbuf_data(packet), frame, length);
+	mbuf_setlen(packet, length);
+	mbuf_pkthdr_setlen(packet, length);
+	const auto tag = frame[25] == MtkAwdl::baRequest ? MwxAwdlTx::BaRequest : MwxAwdlTx::BaAction;
+	return mwx_tx(sc, packet, node, true, tag);
+}
+
+// The request reserves the next TID 0 sequence. The interface sends non-QoS
+// data until the agreement commits or fails, leaving that sequence intact.
+static bool
+mwx_awdl_ba_hold_data(struct mwx_softc *sc, struct ieee80211_node *node, bool eligible, bool qos)
+{
+	if (!sc->sc_awdl_ba_enabled)
+		return false;
+	auto &peer = sc->sc_awdl_peer;
+	auto &ba = peer.ba;
+	const uint64_t now = mwx_now_us();
+	mwx_awdl_ba_expire(sc, now);
+	if (ba.requested()) {
+		if (ba.holdData() && !sc->sc_awdl_peer_busy)
+			task_add(sc->sc_nswq, &sc->sc_awdl_ba_task);
+		return qos || ba.holdData();
+	}
+	if (!eligible) {
+		ba.prepareUntilUS = 0;
+		return false;
+	}
+	if (ba.sendDelba && !ba.firmwareMayExist) {
+		uint8_t frame[MtkAwdl::baDelbaLength];
+		MtkAwdl::buildDelba(frame, sc->sc_awdl_mac, peer.mac);
+		ba.sendDelba = false;
+		(void)mwx_awdl_ba_send(sc, node, frame, sizeof(frame));
+		return false;
+	}
+	if (!ba.canRequest(now) || (!ba.attempts && ba.nextSequence < 4))
+		return false;
+	if (peer.inFlight) {
+		if (!ba.prepareUntilUS)
+			ba.prepareUntilUS = now + MwxAwdlPeer::TxBa::prepareUS;
+		if (now < ba.prepareUntilUS)
+			return true;
+		ba.prepareUntilUS = 0;
+		ba.nextRequestUS = now + MwxAwdlPeer::TxBa::retryUS;
+		return false;
+	}
+
+	if (++sc->sc_awdl_ba_token == 0)
+		++sc->sc_awdl_ba_token;
+	ba.request(sc->sc_awdl_ba_token, now);
+	uint8_t frame[MtkAwdl::baRequestLength];
+	MtkAwdl::buildBaRequest(frame, sc->sc_awdl_mac, peer.mac, ba.token, ba.ssn);
+	const int error = mwx_awdl_ba_send(sc, node, frame, sizeof(frame));
+	if (error) {
+		mwx_awdl_ba_error(sc, uint32_t(error), false, true);
+		return false;
+	}
+	++sc->sc_awdl_completions.peerBaReqSent;
+	return qos;
+}
+
+static MwxAwdlPeer::ChannelWidth
+mwx_awdl_associated_width(struct mwx_softc *sc, struct ieee80211_node *node, uint8_t primary)
+{
+	const MwxAwdlPeer::ChannelWidth narrow{CMD_CBW_20MHZ, primary};
+	if (!node || sc->sc_awdl_max_bw <= 20 || sc->sc_awdl_radio_primary != primary || primary < 36 ||
+	    sc->sc_ic.ic_state != IEEE80211_S_RUN || !(node->ni_chan->ic_flags & IEEE80211_CHAN_5GHZ))
+		return narrow;
+	uint8_t code, center;
+	mwx_node_chan_width(node, &code, &center);
+	const auto assoc = MwxAwdlPeer::associatedWidth(primary, code, center);
+	if (assoc.code == CMD_CBW_20MHZ || assoc != sc->sc_awdl_radio_width)
+		return narrow;
+	const auto width = MwxAwdlPeer::clampWidth(assoc, primary, sc->sc_awdl_max_bw);
+	if (width.code == CMD_CBW_20MHZ)
+		return narrow;
+
+	const int edge = width.code == CMD_CBW_80MHZ ? 6 : 2;
+	for (int sub = int(width.center) - edge; sub <= int(width.center) + edge; sub += 4) {
+		if (sub < 36 || sub >= int(nitems(sc->sc_ic.ic_channels)))
+			return narrow;
+		const auto &channel = sc->sc_ic.ic_channels[sub];
+		if (channel.ic_freq != 5000 + 5 * sub ||
+		    (channel.ic_flags & (IEEE80211_CHAN_DFS | IEEE80211_CHAN_PASSIVE)))
+			return narrow;
+	}
+	return width;
+}
+
 uint8_t MtkMwx::getAwdlChannel(bool &allowed)
 {
 	allowed = false;
@@ -10291,9 +11244,22 @@ uint8_t MtkMwx::getAwdlChannel(bool &allowed)
 	}
 
 	const uint8_t txChannel = allowed ? channel : 0;
-	if (sc->sc_awdl_tx_channel != txChannel) {
+	const auto width = mwx_awdl_associated_width(sc, node, txChannel);
+	if (sc->sc_awdl_tx_channel != txChannel || sc->sc_awdl_width != width) {
 		sc->sc_awdl_tx_channel = txChannel;
+		sc->sc_awdl_width = width;
+		sc->sc_awdl_completions.peerBw = 20;
+		sc->sc_awdl_peer.active = false;
+		sc->sc_awdl_peer.ba.stop(MtkAwdl::PeerBaState::Idle);
+		sc->sc_awdl_peer.stopRxBa();
+		MwxAwdlPeerFirmware firmware{sc};
+		for (uint8_t tid = 0; tid < MwxAwdlPeer::rxBaTids; ++tid)
+			firmware.finishRxBa(tid, sc->sc_awdl_peer.channel);
+		sc->sc_awdl_peer_requested_channel = 0;
+		if (sc->sc_awdl_peer.bssMayExist || sc->sc_awdl_peer_busy)
+			task_add(sc->sc_nswq, &sc->sc_awdl_peer_task);
 		++sc->sc_awdl_channel_epoch;
+		sc->sc_awdl_completions.unicastAcks = {};
 		sc->sc_awdl_completions.verifiedCompletionLastUS = 0;
 		sc->sc_awdl_completions.verifiedCompletionMaxUS = 0;
 	}
@@ -10301,7 +11267,7 @@ uint8_t MtkMwx::getAwdlChannel(bool &allowed)
 }
 
 IOReturn MtkMwx::transmitAwdlAnnouncement(const uint8_t *bytes, size_t length, MtkAwdl::TxKind kind,
-                                          uint8_t expectedChannel)
+                                          uint8_t expectedChannel, bool doorbell)
 {
 	bool allowed = false;
 	const auto channel = getAwdlChannel(allowed);
@@ -10315,8 +11281,17 @@ IOReturn MtkMwx::transmitAwdlAnnouncement(const uint8_t *bytes, size_t length, M
 	    sc->sc_ic.ic_bss : &sc->sc_vif.vif_mn.ni;
 	if (!node || !bytes || length < 40 || length > 2048)
 		return kIOReturnBadArgument;
+	const bool eligible = kind == MtkAwdl::TxKind::DataBaEligible;
+	const bool data = eligible || kind == MtkAwdl::TxKind::Data;
+	const bool qos = data && bytes[0] == 0x88;
+	if (data) {
+		mwx_awdl_request_peer(sc, bytes + 4, channel);
+		const bool dedicated = sc->sc_awdl_dev_active && sc->sc_awdl_peer.matches(bytes + 4, channel);
+		if ((qos && !dedicated) || (dedicated && mwx_awdl_ba_hold_data(sc, node, eligible, qos)))
+			return kIOReturnBusy;
+	}
 	static constexpr MwxAwdlTx tags[] = {MwxAwdlTx::Sync, MwxAwdlTx::Service,
-	    MwxAwdlTx::VerifiedService, MwxAwdlTx::Data, MwxAwdlTx::GroupData};
+	    MwxAwdlTx::VerifiedService, MwxAwdlTx::Data, MwxAwdlTx::GroupData, MwxAwdlTx::Data};
 	if (unsigned(kind) >= nitems(tags))
 		return kIOReturnBadArgument;
 	mbuf_t packet = nullptr;
@@ -10326,10 +11301,26 @@ IOReturn MtkMwx::transmitAwdlAnnouncement(const uint8_t *bytes, size_t length, M
 		mbuf_freem(packet);
 		return kIOReturnNoSpace;
 	}
-	memcpy(mbuf_data(packet), bytes, length);
+	auto *frame = static_cast<uint8_t *>(mbuf_data(packet));
+	memcpy(frame, bytes, length);
+	auto &ba = sc->sc_awdl_peer.ba;
+	if (qos)
+		ItlAWDL::write16(frame + 22, ba.nextSequence << 4);
 	mbuf_setlen(packet, length);
 	mbuf_pkthdr_setlen(packet, length);
-	return mwx_tx(sc, packet, node, true, tags[unsigned(kind)]) ? kIOReturnIOError : kIOReturnSuccess;
+	if (mwx_tx(sc, packet, node, doorbell, tags[unsigned(kind)]) != 0)
+		return kIOReturnIOError;
+	if (qos && !ba.hardwareSequence)
+		ba.submitted();
+	return kIOReturnSuccess;
+}
+
+void MtkMwx::flushAwdlData()
+{
+	auto *loop = getMainWorkLoop();
+	auto *sc = com;
+	if (sc && loop && loop->inGate() && sc->sc_memh && !sc->sc_suspended && !sc->sc_resetting)
+		mwx_write(sc, sc->sc_txq.mq_regbase + MT_DMA_CPU_IDX, sc->sc_txq.mq_prod);
 }
 
 bool MtkMwx::readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &counts)
@@ -10337,7 +11328,48 @@ bool MtkMwx::readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &c
 	auto *loop = getMainWorkLoop();
 	if (!com || !loop || !loop->inGate())
 		return false;
+	const auto now = mwx_now_us();
+	mwx_awdl_ba_expire(com, now);
+	auto &peer = com->sc_awdl_peer;
+	if (peer.active) {
+		bool needsRxBaService = false;
+		for (uint8_t tid = 0; tid < MwxAwdlPeer::rxBaTids; ++tid) {
+			const auto &session = peer.rxBa[tid];
+			if (session.active)
+				com->sc_awdl_reorder[tid].expire(now, [this, &peer](mbuf_t packet) {
+					mwx_awdl_rx_deliver(com, packet, peer.channel);
+				});
+			needsRxBaService |= session.pending || session.stopping;
+		}
+		if (needsRxBaService && !com->sc_awdl_peer_busy)
+			task_add(com->sc_nswq, &com->sc_awdl_ba_task);
+	}
 	counts = com->sc_awdl_completions;
+	counts.peerWcid = MwxAwdlPeer::wcid;
+	counts.peerWcidActive = com->sc_awdl_dev_active && com->sc_awdl_peer.active &&
+	    com->sc_awdl_peer.channel == com->sc_awdl_tx_channel;
+	counts.peerLastDataAckUS = counts.peerWcidActive ? peer.lastDataAckUS : 0;
+	if (counts.peerWcidActive) {
+		memcpy(counts.peerMac, peer.mac, sizeof(counts.peerMac));
+		for (uint8_t tid = 0; tid < MwxAwdlPeer::rxBaTids; ++tid)
+			if (peer.rxBa[tid].active)
+				counts.peerBaRxActiveTidMask |= 1u << tid;
+	}
+	counts.peerFixedBa = com->sc_awdl_fixed_ba;
+	counts.peerWtblProfile = uint8_t(com->sc_awdl_wtbl_profile);
+	counts.peerMaxBw = com->sc_awdl_max_bw;
+	counts.peerCapMask = com->sc_awdl_station_config.capMask;
+	counts.peerMatchingSco = com->sc_awdl_station_config.matchingSco;
+	counts.peerTwoStage = com->sc_awdl_station_config.twoStage;
+	counts.peerTuneGen = com->sc_awdl_tune_gen;
+	counts.peerRxBaEnabled = com->sc_awdl_rx_ba_enabled;
+	counts.peerBw = counts.peerWcidActive ? com->sc_awdl_peer.width.mhz() : 20;
+	counts.peerBaState = !com->sc_awdl_ba_enabled ? MtkAwdl::PeerBaState::Disabled :
+	    counts.peerWcidActive ? com->sc_awdl_peer.ba.state : MtkAwdl::PeerBaState::Idle;
+	counts.peerBaWinSize = counts.peerWcidActive ? com->sc_awdl_peer.ba.window : 0;
+	counts.peerWcidErrors = com->sc_awdl_peer_errors;
+	counts.peerWcidLastError = com->sc_awdl_peer_last_failure.code;
+	counts.peerWcidFailStep = uint8_t(com->sc_awdl_peer_last_failure.step);
 	return true;
 }
 
@@ -10347,28 +11379,117 @@ IOReturn MtkMwx::setAwdlMacAddress(const uint8_t *mac, bool enable)
 	auto *loop = getMainWorkLoop();
 	if (!sc || !loop || !loop->inGate())
 		return kIOReturnNotReady;
-	if (!sc->sc_fw_loaded || !sc->sc_memh || sc->sc_detaching ||
-	    sc->sc_suspended || sc->sc_resetting)
-		return kIOReturnNotReady;
-	if (enable && (!mac || IEEE80211_ADDR_EQ(mac, etheranyaddr) || (mac[0] & 1)))
+	if (enable && !MwxAwdlPeer::validPeerMac(mac))
 		return kIOReturnBadArgument;
+	sc->sc_awdl_want_dev = enable;
+	if (!mwx_awdl_peer_radio_ready(sc) || sc->sc_detaching || sc->sc_resetting)
+		return kIOReturnNotReady;
 
-	if (sc->sc_awdl_dev_active) {
-		if (enable && memcmp(sc->sc_awdl_mac, mac, ETHER_ADDR_LEN) == 0)
-			return kIOReturnSuccess;
-		(void)mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 0);
-		sc->sc_awdl_dev_active = false;
-	}
+	if (enable && sc->sc_awdl_dev_active && memcmp(sc->sc_awdl_mac, mac, ETHER_ADDR_LEN) == 0)
+		return kIOReturnSuccess;
+
+	if (mwx_awdl_peer_shutdown(sc, true, true) != 0)
+		return kIOReturnIOError;
 	if (!enable) {
 		memset(sc->sc_awdl_mac, 0, ETHER_ADDR_LEN);
 		return kIOReturnSuccess;
 	}
+	if (!sc->sc_awdl_want_dev || !mwx_awdl_peer_radio_ready(sc) ||
+	    sc->sc_resetting || sc->sc_detaching)
+		return kIOReturnNotReady;
 
+	sc->sc_awdl_peer_busy = true;
 	memcpy(sc->sc_awdl_mac, mac, ETHER_ADDR_LEN);
-	int rv = mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 1);
-	sc->sc_awdl_dev_active = (rv == 0);
-	MWX_DEV_LOG(sc, "AWDL: DEV_INFO_ACTIVE omac=%u enable=1 rv=%d\n", HW_BSSID_1, rv);
-	return rv == 0 ? kIOReturnSuccess : kIOReturnIOError;
+	const auto error = mt7921_mcu_awdl_dev_update(sc, sc->sc_awdl_mac, 1);
+	sc->sc_awdl_dev_active = !error;
+	if (error)
+		mwx_awdl_peer_error(sc, {MwxAwdlPeer::FailStep::DevUpdate, error});
+	mwx_awdl_peer_unlock(sc);
+	return error ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+IOReturn MtkMwx::tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &req)
+{
+	auto *sc = com;
+	auto *loop = getMainWorkLoop();
+	if (!sc || !loop || !loop->inGate() || sc->sc_detaching || sc->sc_resetting || sc->sc_suspended)
+		return kIOReturnNotReady;
+
+	const bool prevActive = sc->sc_awdl_peer.active;
+	const uint8_t prevChannel = sc->sc_awdl_peer.channel;
+	uint8_t prevMac[IEEE80211_ADDR_LEN] = {};
+	if (prevActive)
+		memcpy(prevMac, sc->sc_awdl_peer.mac, sizeof(prevMac));
+
+	if (prevActive && !sc->sc_awdl_peer_busy && sc->sc_awdl_peer.ba.active() &&
+	    sc->sc_awdl_dev_active && mwx_awdl_peer_radio_ready(sc)) {
+		auto *node = (sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_ic.ic_bss) ?
+		    sc->sc_ic.ic_bss : &sc->sc_vif.vif_mn.ni;
+		uint8_t frame[MtkAwdl::baDelbaLength];
+		MtkAwdl::buildDelba(frame, sc->sc_awdl_mac, prevMac);
+		(void)mwx_awdl_ba_send(sc, node, frame, sizeof(frame));
+	}
+
+	// Safely tear down WCID 14 + BSS 1 + TX/RX BA while keeping DEV_INFO (HW_BSSID_1) and en0 untouched.
+	if (mwx_awdl_peer_shutdown(sc, mwx_awdl_peer_radio_ready(sc), false) != 0)
+		return kIOReturnIOError;
+
+	if (req.setFixedBa)
+		sc->sc_awdl_fixed_ba = req.fixedBa;
+	if (req.setMaxBw)
+		sc->sc_awdl_max_bw = MwxAwdlPeer::sanitizeMaxBw(req.maxBw);
+	if (req.setCapMask)
+		sc->sc_awdl_station_config.capMask = req.capMask & MwxAwdlPeer::capMaskAll;
+	if (req.setMatchingSco)
+		sc->sc_awdl_station_config.matchingSco = req.matchingSco;
+	if (req.setTwoStage)
+		sc->sc_awdl_station_config.twoStage = req.twoStage;
+
+	auto *node = (sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_ic.ic_bss) ? sc->sc_ic.ic_bss : nullptr;
+	sc->sc_awdl_width = mwx_awdl_associated_width(sc, node, sc->sc_awdl_tx_channel);
+	sc->sc_awdl_completions.peerBw = 20;
+	sc->sc_awdl_peer_retry_us = 0;
+
+	if (req.resetStats) {
+		auto &counts = sc->sc_awdl_completions;
+		counts.peerTxSampleRequests = 0;
+		counts.peerTxStatus = {};
+		counts.peerAggTxSent = 0;
+		counts.peerAggTxFailed = 0;
+		counts.peerAggLastStatus = 0;
+		counts.peerBaReqSent = 0;
+		counts.peerBaReqAcked = 0;
+		counts.peerBaReqFailed = 0;
+		counts.peerBaRespOk = 0;
+		counts.peerBaDelba = 0;
+		counts.peerBaErrors = 0;
+		counts.peerBaLastError = 0;
+		counts.peerWcidErrors = 0;
+		counts.peerWcidLastError = 0;
+		counts.peerWcidFailStep = 0;
+		sc->sc_awdl_peer_errors = 0;
+		sc->sc_awdl_peer_last_failure = {};
+		sc->sc_awdl_txs_sampling = 0;
+		sc->sc_awdl_rate_idx = 0;
+		sc->sc_awdl_rate_acks = 0;
+		sc->sc_awdl_rate_window = 0;
+		sc->sc_awdl_rate_fails = 0;
+		sc->sc_awdl_rate_consec_fails = 0;
+		sc->sc_awdl_rate_hold = 0;
+		counts.txRateIdx = 0;
+	}
+
+	++sc->sc_awdl_tune_gen;
+	const bool rebuild = prevActive && prevChannel && prevChannel == sc->sc_awdl_tx_channel &&
+	    MwxAwdlPeer::validPeerMac(prevMac);
+	IOLog("MTK AWDL: hot-tune gen=%u fixed_ba=%u max_bw=%u width=%u cap_mask=0x%02x sco=%u two_stage=%u rebuild=%u\n",
+	    sc->sc_awdl_tune_gen, unsigned(sc->sc_awdl_fixed_ba), unsigned(sc->sc_awdl_max_bw),
+	    unsigned(sc->sc_awdl_width.mhz()), unsigned(sc->sc_awdl_station_config.capMask),
+	    unsigned(sc->sc_awdl_station_config.matchingSco),
+	    unsigned(sc->sc_awdl_station_config.twoStage), unsigned(rebuild));
+	if (rebuild)
+		mwx_awdl_request_peer(sc, prevMac, prevChannel);
+	return kIOReturnSuccess;
 }
 #endif
 

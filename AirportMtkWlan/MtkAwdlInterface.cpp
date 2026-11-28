@@ -448,7 +448,13 @@ IOReturn MtkAWDLInterface::submitAction(IO80211Controller *controller, mbuf_t pa
     if (!length)
         return kIOReturnBadArgument;
 
-    const auto rxUS = clockUS();
+    observePeerTiming(frame, length, channel, rssi, clockUS());
+    return submitNativeAction(controller, frame, length, channel, rssi);
+}
+
+IOReturn MtkAWDLInterface::submitNativeAction(IO80211Controller *controller, const uint8_t *frame,
+                                            size_t length, uint32_t channel, int32_t rssi)
+{
     auto *pool = itlGetMgmtFramePool(controller);
     auto *buffer = pool ? pool->getBuffer() : nullptr;
     if (!buffer)
@@ -470,8 +476,40 @@ IOReturn MtkAWDLInterface::submitAction(IO80211Controller *controller, mbuf_t pa
     metadata.rssi = rssi;
     // The native handler consumes the buffer lease on every path.
     itlSubmitMgmtFrame(this, buffer, 12, &metadata, sizeof(metadata));
-    observePeerTiming(frame, length, channel, rxUS);
     return kIOReturnSuccess;
+}
+
+void MtkAWDLInterface::serviceNativeKeepalives(AirportItlwm *controller, uint64_t now,
+                                               const MtkAwdl::UnicastAcks &acks)
+{
+    if (!activeChannel || !nativeStarted || !configurationLock)
+        return;
+
+    for (auto &entry : observedPeers) {
+        if (entry.channel != activeChannel || !entry.lastActionLength ||
+            !MtkAwdl::nativeKeepaliveDue(now, entry.lastFrameUS, entry.lastKeepaliveUS,
+                                         acks.lastActive(entry.address), entry.lastDataRxUS))
+            continue;
+
+        apple80211_awdl_sync_enabled sync = {};
+        IOLockLock(configurationLock);
+        configuration.readSyncEnabled(&sync);
+        IOLockUnlock(configurationLock);
+        if (!sync.enabled)
+            return;
+
+        uint8_t frame[MtkAwdl::nativeKeepaliveActionMax];
+        if (!MtkAwdl::refreshNativeAction(entry.lastAction, entry.lastActionLength,
+                now - entry.lastActionRxUS, entry.keepaliveSeq, frame, sizeof(frame)))
+            continue;
+        // The cached Action is only for native peer aging. Driver timing uses radio RX.
+        if (submitNativeAction(controller, frame, entry.lastActionLength, entry.channel,
+                               entry.lastActionRssi) == kIOReturnSuccess) {
+            entry.keepaliveSeq = ItlAWDL::read16(frame + 22) >> 4;
+            entry.lastKeepaliveUS = now;
+            setProperty("MtkAwdlNativeKeepalives", ++nativeKeepalives, 32);
+        }
+    }
 }
 
 void MtkAWDLInterface::observeAction(IO80211Controller *controller, mbuf_t packet,
@@ -514,7 +552,7 @@ void MtkAWDLInterface::publishTimingPeer()
 }
 
 MtkAWDLInterface::PeerObservation &MtkAWDLInterface::recordPeer(
-    const uint8_t *frame, size_t length, uint32_t channel, uint64_t now, bool &hasSchedule)
+    const uint8_t *frame, size_t length, uint32_t channel, int32_t rssi, uint64_t now, bool &hasSchedule)
 {
     const auto *source = frame + 10;
     PeerObservation *entry = &observedPeers[0];
@@ -535,6 +573,16 @@ MtkAWDLInterface::PeerObservation &MtkAWDLInterface::recordPeer(
     }
     ++entry->frames;
     entry->lastFrameUS = now;
+    if (activeChannel && channel == activeChannel) {
+        entry->lastActionLength = 0;
+        if (length <= sizeof(entry->lastAction)) {
+            memcpy(entry->lastAction, frame, length);
+            entry->lastActionLength = length;
+            entry->lastActionRxUS = now;
+            entry->lastActionRssi = rssi;
+            entry->keepaliveSeq = ItlAWDL::read16(frame + 22) >> 4;
+        }
+    }
     const auto arpa = MtkAwdl::inspectArpaName(frame, length, testPeer.hostname);
     if (arpa != MtkAwdl::ArpaName::Absent && arpa >= entry->arpa)
         entry->arpa = arpa;
@@ -545,7 +593,71 @@ MtkAWDLInterface::PeerObservation &MtkAWDLInterface::recordPeer(
         entry->sync = sync;
         entry->lastScheduleUS = now;
     }
+    MtkAwdl::PeerElection election;
+    if (MtkAwdl::parsePeerElection(frame, length, now, election)) {
+        const auto &previous = entry->election;
+        // A v1-only frame cannot update a recently observed v2 root counter.
+        if (election.hasCounter || !previous.hasCounter ||
+            now - previous.heardUS >= ItlAWDL::kPeerScheduleStaleUS ||
+            memcmp(election.master, previous.master, sizeof(election.master)))
+            entry->election = election;
+    }
     return *entry;
+}
+
+bool MtkAWDLInterface::autoTimingAllowed() const
+{
+    constexpr uint8_t zero[6] = {};
+    return !testPeer.hostname[0] && !memcmp(testPeer.address, zero, sizeof(zero));
+}
+
+const uint8_t *MtkAWDLInterface::queuedUnicastPeer() const
+{
+    if (!dataQueued)
+        return nullptr;
+    const auto &slot = dataFrames[dataHead];
+    const auto *mac = slot.bytes;
+    constexpr uint8_t zero[6] = {};
+    const auto own = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
+    return slot.length >= 54 && !(mac[0] & 1) && memcmp(mac, zero, 6) &&
+        memcmp(mac, &own, 6) && !memcmp(mac + 6, &own, 6) ? mac : nullptr;
+}
+
+void MtkAWDLInterface::bindTimingPeer(const uint8_t *mac, uint64_t now)
+{
+    if (!autoTimingAllowed() || !memcmp(timingPeer, mac, sizeof(timingPeer)))
+        return;
+    memcpy(timingPeer, mac, sizeof(timingPeer));
+    timingPeerBoundUS = now;
+    peerSchedule.reset();
+    windowEvidence = {};
+    dataPause = {};
+    dataProbe = {};
+    windowStatePublished = false;
+    targetFrames = targetSchedules = 0;
+    setProperty("MtkAwdlAutoTimingPeer", true);
+    publishTimingPeer();
+    removeProperty("MtkAwdlWindowPeerSequence");
+    setProperty("MtkAwdlWindowRxSamples", UInt64(0), 32);
+    setProperty("MtkAwdlWindowRxMatches", UInt64(0), 32);
+    setProperty("MtkAwdlWindowSlotOffset", UInt64(0), 32);
+    setProperty("MtkAwdlDataPauses", UInt64(0), 32);
+    setProperty("MtkAwdlDataForcedResumes", UInt64(0), 32);
+    setProperty("MtkAwdlDataHeldBack", UInt64(0), 32);
+    for (const auto &entry : observedPeers) {
+        if (entry.channel == activeChannel && !memcmp(entry.address, mac, 6) &&
+            entry.lastScheduleUS && now >= entry.lastScheduleUS &&
+            now - entry.lastScheduleUS < ItlAWDL::kPeerScheduleStaleUS) {
+            targetFrames = entry.frames;
+            targetSchedules = entry.schedules;
+            dataProbe.lastRxUS = entry.lastFrameUS;
+            noteSchedule(entry.sync, entry.lastScheduleUS);
+            break;
+        }
+    }
+    setProperty("MtkAwdlTargetFrames", targetFrames, 32);
+    setProperty("MtkAwdlTargetSchedules", targetSchedules, 32);
+    publishWindowState(now);
 }
 
 void MtkAWDLInterface::reviewPeers(uint64_t now)
@@ -559,12 +671,21 @@ void MtkAWDLInterface::reviewPeers(uint64_t now)
 
     constexpr uint8_t zero[6] = {};
     PeerObservation *matched = nullptr;
+    PeerObservation *latest = nullptr;
+    uint64_t currentSync = timingPeerBoundUS;
     unsigned matches = 0;
     unsigned index = 0;
     for (auto &entry : observedPeers) {
         unsigned slot = index++;
         if (!entry.frames)
             continue;
+        if (entry.channel == activeChannel && entry.lastScheduleUS) {
+            if (!memcmp(entry.address, timingPeer, 6) && entry.lastScheduleUS > currentSync)
+                currentSync = entry.lastScheduleUS;
+            if (now >= entry.lastScheduleUS && now - entry.lastScheduleUS < ItlAWDL::kPeerScheduleStaleUS &&
+                (!latest || latest->lastScheduleUS < entry.lastScheduleUS))
+                latest = &entry;
+        }
         const auto age = now - entry.lastFrameUS;
         const bool fresh = age < ItlAWDL::kPeerScheduleStaleUS;
         auto *peer = manager && fresh ? nativeFindAwdlPeer(manager, entry.address) : nullptr;
@@ -588,6 +709,15 @@ void MtkAWDLInterface::reviewPeers(uint64_t now)
         setProperty(key, text);
     }
 
+    if (autoTimingAllowed() && latest && !queuedUnicastPeer() &&
+        MtkAwdl::idleTimingPeerExpired(now, currentSync, latest->lastScheduleUS)) {
+        bool transferring = false;
+        for (const auto &entry : dataActivity.entries)
+            transferring |= entry.recent(now, 1000000);
+        if (!transferring)
+            bindTimingPeer(latest->address, now);
+    }
+
     if (matches != 1 || !testPeer.hostname[0] || memcmp(timingPeer, zero, sizeof(timingPeer)))
         return;
     memcpy(timingPeer, matched->address, sizeof(timingPeer));
@@ -602,7 +732,8 @@ void MtkAWDLInterface::reviewPeers(uint64_t now)
     publishTimingPeer();
 }
 
-void MtkAWDLInterface::observePeerTiming(const uint8_t *frame, size_t length, uint32_t channel, uint64_t now)
+void MtkAWDLInterface::observePeerTiming(const uint8_t *frame, size_t length, uint32_t channel,
+                                        int32_t rssi, uint64_t now)
 {
     const uint64_t own = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
     constexpr uint8_t zero[6] = {};
@@ -610,18 +741,14 @@ void MtkAWDLInterface::observePeerTiming(const uint8_t *frame, size_t length, ui
     if ((source[0] & 1) || !memcmp(source, &own, 6) || !memcmp(source, zero, 6))
         return;
     bool hasSchedule = false;
-    const auto &entry = recordPeer(frame, length, channel, now, hasSchedule);
-    if (!memcmp(timingPeer, zero, sizeof(timingPeer))) {
-        if (!testPeer.hostname[0] && activeChannel && channel == activeChannel && hasSchedule) {
-            memcpy(timingPeer, source, sizeof(timingPeer));
-            setProperty("MtkAwdlAutoTimingPeer", true);
-            publishTimingPeer();
-        } else {
-            return;
-        }
-    } else if (memcmp(source, timingPeer, sizeof(timingPeer))) {
+    const auto &entry = recordPeer(frame, length, channel, rssi, now, hasSchedule);
+    if (!memcmp(timingPeer, zero, sizeof(timingPeer)) && autoTimingAllowed() &&
+        activeChannel && channel == activeChannel && hasSchedule) {
+        bindTimingPeer(source, now);
         return;
     }
+    if (memcmp(source, timingPeer, sizeof(timingPeer)))
+        return;
     ++targetFrames;
     if (targetFrames <= 4 || !(targetFrames % 8)) {
         setProperty("MtkAwdlTargetFrames", targetFrames, 32);
@@ -629,6 +756,7 @@ void MtkAWDLInterface::observePeerTiming(const uint8_t *frame, size_t length, ui
     }
     if (!activeChannel || channel != activeChannel)
         return;
+    dataProbe.lastRxUS = now;
     if (!hasSchedule)
         return;
     ++targetSchedules;
@@ -646,7 +774,12 @@ void MtkAWDLInterface::noteSchedule(const ItlAWDL::PeerSyncInfo &sync, uint64_t 
     const auto update = peerSchedule.note(sync, now, activeChannel);
     const bool reanchored = update != Update::Stable;
     if (reanchored) {
-        windowEvidence = {};
+        const bool continuousSequence = update == Update::Sequence && peerSchedule.known();
+        if (windowEvidence.reanchor(continuousSequence)) {
+            ++sequencesPreserved;
+            if (dataPause.paused)
+                dataPause.refreshLimit(now, peerSchedule.pauseLimitDataUS(now, 0, kDataResumeLateUS));
+        }
         ++scheduleEpochs;
         scheduleGaps += update == Update::Gap;
         phaseReanchors += update == Update::Phase;
@@ -670,6 +803,7 @@ void MtkAWDLInterface::noteSchedule(const ItlAWDL::PeerSyncInfo &sync, uint64_t 
         setProperty("MtkAwdlWindowRxMatches", windowEvidence.matches(), 32);
         setProperty("MtkAwdlWindowChannelSlots", peerSchedule.presentEntries(), 32);
         setProperty("MtkAwdlWindowSeqChanges", peerSchedule.sequenceChanges, 32);
+        setProperty("MtkAwdlWindowSeqPreserved", sequencesPreserved, 32);
         setProperty("MtkAwdlWindowEpochs", scheduleEpochs, 32);
         setProperty("MtkAwdlWindowGapReanchors", scheduleGaps, 32);
         setProperty("MtkAwdlWindowPhaseReanchors", phaseReanchors, 32);
@@ -742,9 +876,12 @@ void MtkAWDLInterface::refreshChannel(AirportItlwm *controller)
     nextPeerReviewUS = 0;
     setProperty("MtkAwdlNativePeerMatched", false);
     peerSchedule.reset();
+    dataPause = {};
+    dataProbe = {};
     targetFrames = targetSchedules = 0;
     windowEvidence = {};
-    scheduleEpochs = scheduleGaps = phaseReanchors = 0;
+    scheduleEpochs = scheduleGaps = phaseReanchors = sequencesPreserved = 0;
+    setProperty("MtkAwdlWindowSeqPreserved", sequencesPreserved, 32);
     if (testPeer.hostname[0]) {
         memset(timingPeer, 0, sizeof(timingPeer));
         removeProperty("MtkAwdlTimingPeer");
@@ -753,22 +890,10 @@ void MtkAWDLInterface::refreshChannel(AirportItlwm *controller)
     setProperty("MtkAwdlTargetFrames", UInt64(0), 32);
     removeProperty("MtkAwdlTargetRxChannel");
     verifiedAnnouncementsQueued = 0;
-    controller->readAwdlAnnouncementCompletions(lastCompletions);
-    peerFirmwareBaseline = lastCompletions.verifiedServiceSent;
-    nextAnnouncement = 0;
-    nextIsMI = false;
-    if (ipv6Enabled) {
-        ipv6Enabled = false;
-        dataRejected += dataQueued;
-        dataQueued = 0;
-        drainDataCompletions();
-        for (auto *q : queues)
-            if (q)
-                q->disable();
-        setRunningState(false);
-        setProperty("MtkAwdlIPv6Enabled", false);
-        setProperty("MtkAwdlQueuesEnabled", false);
-    }
+    MtkAwdl::AnnouncementCompletions counts;
+    if (controller->readAwdlAnnouncementCompletions(counts))
+        peerFirmwareBaseline = counts.verifiedServiceSent;
+    announcements = {};
     setProperty("MtkAwdlActiveChannel", next, 32);
     removeProperty("MtkAwdlWindowPeerSequence");
     setProperty("MtkAwdlWindowRxSamples", UInt64(0), 32);
@@ -791,40 +916,48 @@ void MtkAWDLInterface::announcementTimerFired(OSObject *owner, IOTimerEventSourc
     auto now = clockUS();
     if (controller && mtk_awdl_diagnostics_enabled()) {
         interface->refreshChannel(controller);
-        interface->syncHardwareMac(controller);
         interface->syncIPv6State(controller);
+        interface->syncHardwareMac(controller);
         interface->reviewPeers(now);
-        interface->syncNeighbors(now);
         interface->publishWindowState(now);
         interface->publishCompletions(controller);
+        now = clockUS();
+        interface->syncNeighbors(now);
         interface->drainDataCompletions();
         now = clockUS();
-        if (interface->activeChannel && now >= interface->nextAnnouncement)
-            interface->sendAnnouncement(controller, now);
+        if (interface->activeChannel) {
+            if (interface->announcements.due(false, now))
+                interface->sendAnnouncement(controller, now, false);
+            if (interface->announcements.due(true, now))
+                interface->sendAnnouncement(controller, now, true);
+        }
         if (interface->ipv6Enabled) {
             interface->serviceData(controller, now);
             interface->drainDataCompletions();
+            interface->resumeTxQueueIfNeeded();
         }
     }
     uint64_t delayUS = 20000;
-    if (interface->nextAnnouncement > now && interface->nextAnnouncement - now < delayUS)
-        delayUS = interface->nextAnnouncement - now;
+    const uint64_t deadlines[] = {interface->announcements.psf, interface->announcements.mi};
+    for (uint64_t due : deadlines)
+        if (due > now && due - now < delayUS)
+            delayUS = due - now;
     if (interface->windowEvidence.reliable() &&
-        (interface->ipv6Enabled || now >= interface->nextAnnouncement)) {
+        (interface->ipv6Enabled || interface->announcements.due(true, now))) {
         const auto next = interface->peerSchedule.usUntilPresentAw(now);
         if (next && next < delayUS)
             delayUS = next;
     }
     if (interface->ipv6Enabled) {
-        if (interface->dataQueued)
-            delayUS = 300;
+        if ((interface->dataQueued && !interface->dataPause.paused) || interface->dataDoneCount)
+            delayUS = min(delayUS, 300ULL);
         else if (delayUS > 2000)
             delayUS = 2000;
     }
     timer->setTimeoutUS(unsigned(delayUS < 300 ? 300 : delayUS));
 }
 
-void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS)
+void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS, bool useMI)
 {
     if (!configurationLock)
         return;
@@ -837,10 +970,12 @@ void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS
     apple80211_awdl_sync_enabled request = {};
     IOLockLock(configurationLock);
     configuration.readSyncEnabled(&request);
-    const bool useMI = masterIndicationLength && nextIsMI;
+
     const auto state = windowState(nowUS);
     const bool inWindow = state == WindowState::Eligible;
-    if (useMI && state == WindowState::Waiting) {
+    if (useMI && masterIndicationLength && state == WindowState::Waiting) {
+        const auto delay = peerSchedule.usUntilPresentAw(nowUS);
+        announcements.defer(true, nowUS, delay ? delay : 2000);
         if (++windowDeferred <= 4 || !(windowDeferred % 16))
             setProperty("MtkAwdlWindowDeferred", windowDeferred, 32);
         IOLockUnlock(configurationLock);
@@ -848,19 +983,44 @@ void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS
     }
     const auto *nativeTemplate = useMI ? masterIndication : configuration.frameTemplate();
     const size_t nativeLength = useMI ? masterIndicationLength : configuration.frameTemplateLength();
+    if (!announcementEpochUS)
+        announcementEpochUS = nowUS;
+    MtkAwdl::AnnouncementTiming timing;
+    timing.localEpochUS = announcementEpochUS;
+    const PeerObservation *latestSync = nullptr;
+    for (const auto &entry : observedPeers) {
+        if (!entry.frames || memcmp(entry.address, timingPeer, sizeof(timingPeer)))
+            continue;
+        if (entry.election.heardUS && (!timing.peer || entry.election.heardUS > timing.peer->heardUS))
+            timing.peer = &entry.election;
+        if (!entry.lastScheduleUS)
+            continue;
+        if (!latestSync || entry.lastScheduleUS > latestSync->lastScheduleUS)
+            latestSync = &entry;
+        if (entry.channel == activeChannel && entry.lastScheduleUS == peerSchedule.heardUS) {
+            timing.clock = &peerSchedule;
+            timing.sync = &entry.sync;
+        }
+    }
+    if (!timing.sync && latestSync)
+        timing.sync = &latestSync->sync;
+    MtkAwdl::AdvertisedElection advertised;
     const bool ready = request.enabled && nativeLength;
     const bool built = ready && MtkAwdl::buildAnnouncement(source, activeChannel, announcementSequence, nowUS,
         nativeTemplate, nativeLength, announcementTLVs,
-        sizeof(announcementTLVs), announcementFrame, sizeof(announcementFrame), &length, &services, useMI);
+        sizeof(announcementTLVs), announcementFrame, sizeof(announcementFrame), &length, &services,
+        useMI, timing, &advertised);
     IOLockUnlock(configurationLock);
     if (built && useMI && inWindow && !peerSchedule.inPresentAwStart(clockUS(), 4500)) {
+        announcements.defer(true, nowUS, 2000);
         if (++lateWindowBuilds <= 4 || !(lateWindowBuilds % 8))
             setProperty("MtkAwdlWindowHostLate", lateWindowBuilds, 32);
         return;
     }
-    nextAnnouncement = nowUS + 112640;
-    if (!ready)
+    if (!ready) {
+        announcements.attempted(useMI, nowUS, false);
         return;
+    }
 
     const bool advertisesService = services.advertisesService();
     const bool verified = useMI && inWindow && services.airDropPtrs;
@@ -868,12 +1028,25 @@ void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS
         advertisesService ? MtkAwdl::TxKind::Service : MtkAwdl::TxKind::Sync;
     const IOReturn result = built ? controller->transmitAwdlAnnouncement(
         announcementFrame, length, kind, activeChannel) : kIOReturnBadArgument;
+    announcements.attempted(useMI, nowUS, result == kIOReturnBusy);
     const uint32_t attempt = ++announcementAttempts;
     if (result == kIOReturnSuccess) {
         ++announcementsQueued;
+        if (!advertisedElectionPublished || advertised.following != lastAdvertisedElection.following ||
+            advertised.counter != lastAdvertisedElection.counter || advertised.hops != lastAdvertisedElection.hops ||
+            memcmp(advertised.master, lastAdvertisedElection.master, sizeof(advertised.master))) {
+            setProperty("MtkAwdlFollowingMaster", advertised.following);
+            setProperty("MtkAwdlAdvertisedMetric", MtkAwdl::electionMetric, 32);
+            setProperty("MtkAwdlAdvertisedRlfc", advertised.counter, 32);
+            setProperty("MtkAwdlAdvertisedHopCount", advertised.hops, 32);
+            lastAdvertisedElection = advertised;
+            advertisedElectionPublished = true;
+        }
         serviceAnnouncementsQueued += advertisesService;
         serviceRecordsQueued += services.records;
-        nextIsMI = !nextIsMI;
+        auto &sent = useMI ? miSent : psfSent;
+        setProperty(useMI ? "MtkAwdlMiSent" : "MtkAwdlPsfSent", ++sent, 32);
+        setProperty(useMI ? "MtkAwdlMiLastEnqueueUS" : "MtkAwdlPsfLastEnqueueUS", clockUS(), 64);
         ++announcementSequence;
         if (verified)
             setProperty("MtkAwdlWindowAirDropPTRQueued", ++verifiedAnnouncementsQueued, 32);
@@ -898,9 +1071,60 @@ void MtkAWDLInterface::sendAnnouncement(AirportItlwm *controller, uint64_t nowUS
 void MtkAWDLInterface::publishCompletions(AirportItlwm *controller)
 {
     MtkAwdl::AnnouncementCompletions counts;
-    if (!controller->readAwdlAnnouncementCompletions(counts) ||
-        (counts.sent == lastCompletions.sent && counts.failed == lastCompletions.failed &&
-         counts.dataSent == lastCompletions.dataSent && counts.dataFailed == lastCompletions.dataFailed))
+    if (!controller->readAwdlAnnouncementCompletions(counts))
+        return;
+    if (counts.peerWcidActive) {
+        dataActivity.note(counts.peerMac, counts.peerLastDataAckUS);
+        if (!queuedUnicastPeer() && (!lastCompletions.peerWcidActive ||
+            memcmp(lastCompletions.peerMac, counts.peerMac, sizeof(counts.peerMac))))
+            bindTimingPeer(counts.peerMac, clockUS());
+    }
+    serviceNativeKeepalives(controller, clockUS(), counts.unicastAcks);
+    if ((counts.sent == lastCompletions.sent && counts.failed == lastCompletions.failed &&
+         counts.dataSent == lastCompletions.dataSent && counts.dataFailed == lastCompletions.dataFailed &&
+         counts.txRateIdx == lastCompletions.txRateIdx &&
+         counts.peerWcid == lastCompletions.peerWcid &&
+         counts.peerWcidActive == lastCompletions.peerWcidActive &&
+         !memcmp(counts.peerMac, lastCompletions.peerMac, sizeof(counts.peerMac)) &&
+         counts.peerWcidErrors == lastCompletions.peerWcidErrors &&
+         counts.peerWcidLastError == lastCompletions.peerWcidLastError &&
+         counts.peerWcidFailStep == lastCompletions.peerWcidFailStep &&
+         counts.peerBaState == lastCompletions.peerBaState &&
+         counts.peerBaWinSize == lastCompletions.peerBaWinSize &&
+         counts.peerBaReqSent == lastCompletions.peerBaReqSent &&
+         counts.peerBaReqAcked == lastCompletions.peerBaReqAcked &&
+         counts.peerBaReqFailed == lastCompletions.peerBaReqFailed &&
+         counts.peerBaRxAny == lastCompletions.peerBaRxAny &&
+         counts.peerBaRxRespSent == lastCompletions.peerBaRxRespSent &&
+         counts.peerBaRxReq == lastCompletions.peerBaRxReq &&
+         counts.peerTxStatus == lastCompletions.peerTxStatus &&
+         counts.unicastLastFailStatus == lastCompletions.unicastLastFailStatus &&
+         counts.peerTxSampleRequests == lastCompletions.peerTxSampleRequests &&
+         counts.peerAggTxSent == lastCompletions.peerAggTxSent &&
+         counts.peerAggTxFailed == lastCompletions.peerAggTxFailed &&
+         counts.peerAggLastStatus == lastCompletions.peerAggLastStatus &&
+         counts.bgScanDeferred == lastCompletions.bgScanDeferred &&
+         counts.peerWtblProfile == lastCompletions.peerWtblProfile &&
+         counts.peerMaxBw == lastCompletions.peerMaxBw &&
+         counts.peerCapMask == lastCompletions.peerCapMask &&
+         counts.peerMatchingSco == lastCompletions.peerMatchingSco &&
+         counts.peerTwoStage == lastCompletions.peerTwoStage &&
+         counts.peerTuneGen == lastCompletions.peerTuneGen &&
+         counts.peerBaRxRejectFilter == lastCompletions.peerBaRxRejectFilter &&
+         counts.peerBaRxRejectResponder == lastCompletions.peerBaRxRejectResponder &&
+         counts.peerFixedBa == lastCompletions.peerFixedBa &&
+         counts.peerRxBaEnabled == lastCompletions.peerRxBaEnabled &&
+         counts.peerBaRxTidMask == lastCompletions.peerBaRxTidMask &&
+         counts.peerBaRxActiveTidMask == lastCompletions.peerBaRxActiveTidMask &&
+         counts.peerBaRxReconfigs == lastCompletions.peerBaRxReconfigs &&
+         counts.peerBaRxOtherTid == lastCompletions.peerBaRxOtherTid &&
+         counts.peerBw == lastCompletions.peerBw &&
+         counts.peerBaRxRejected == lastCompletions.peerBaRxRejected &&
+         counts.peerBaRxLastStatus == lastCompletions.peerBaRxLastStatus &&
+         counts.peerBaRespOk == lastCompletions.peerBaRespOk &&
+         counts.peerBaDelba == lastCompletions.peerBaDelba &&
+         counts.peerBaErrors == lastCompletions.peerBaErrors &&
+         counts.peerBaLastError == lastCompletions.peerBaLastError))
         return;
     setProperty("MtkAwdlTxFirmwareSent", counts.sent, 32);
     setProperty("MtkAwdlTxFirmwareFailed", counts.failed, 32);
@@ -912,7 +1136,58 @@ void MtkAWDLInterface::publishCompletions(AirportItlwm *controller)
     setProperty("MtkAwdlWindowCompletionMaxUS", counts.verifiedCompletionMaxUS, 32);
     setProperty("MtkAwdlIPv6FirmwareSent", counts.dataSent, 32);
     setProperty("MtkAwdlIPv6UnicastFirmwareSent", counts.unicastReportedSent, 32);
+    setProperty("MtkAwdlIPv6UnicastFirmwareFailed", counts.unicastReportedFailed, 32);
+    setProperty("MtkAwdlIPv6UnicastLastStatus", counts.unicastLastFailStatus, 32);
+    setProperty("MtkAwdlPeerTxSampleRequests", counts.peerTxSampleRequests, 32);
+    setProperty("MtkAwdlPeerTxRawTxs", counts.peerTxStatus.raw, 32);
+    setProperty("MtkAwdlPeerTxRawLastWcid", counts.peerTxStatus.lastRawWcid, 32);
+    setProperty("MtkAwdlPeerTxRawLastPid", counts.peerTxStatus.lastRawPid, 32);
+    setProperty("MtkAwdlPeerAggTxSent", counts.peerAggTxSent, 32);
+    setProperty("MtkAwdlPeerAggTxFailed", counts.peerAggTxFailed, 32);
+    setProperty("MtkAwdlPeerAggLastStatus", counts.peerAggLastStatus, 32);
+    setProperty("MtkAwdlBgScanDeferred", counts.bgScanDeferred, 32);
+    setProperty("MtkAwdlPeerWtblProfile", counts.peerWtblProfile, 32);
+    setProperty("MtkAwdlPeerMaxBw", counts.peerMaxBw, 32);
+    setProperty("MtkAwdlPeerCapMask", counts.peerCapMask, 32);
+    setProperty("MtkAwdlPeerMatchingSco", counts.peerMatchingSco);
+    setProperty("MtkAwdlPeerTwoStage", counts.peerTwoStage);
+    setProperty("MtkAwdlPeerTuneGeneration", counts.peerTuneGen, 32);
+    setProperty("MtkAwdlPeerBaRxRejectFilter", counts.peerBaRxRejectFilter, 32);
+    setProperty("MtkAwdlPeerBaRxRejectResponder", counts.peerBaRxRejectResponder, 32);
     setProperty("MtkAwdlIPv6FirmwareFailed", counts.dataFailed, 32);
+    setProperty("MtkAwdlTxRateIdx", counts.txRateIdx, 32);
+    setProperty("MtkAwdlPeerWcid", counts.peerWcid, 32);
+    setProperty("MtkAwdlPeerWcidActive", counts.peerWcidActive);
+    setProperty("MtkAwdlPeerWcidErrors", counts.peerWcidErrors, 32);
+    setProperty("MtkAwdlPeerWcidLastError", UInt64(counts.peerWcidLastError), 64);
+    setProperty("MtkAwdlPeerWcidFailStep", counts.peerWcidFailStep, 32);
+    static const char *const baStates[] = {"idle", "requested", "active", "failed", "disabled"};
+    setProperty("MtkAwdlPeerBaState", baStates[unsigned(counts.peerBaState)]);
+    setProperty("MtkAwdlPeerBaWinSize", counts.peerBaWinSize, 32);
+    setProperty("MtkAwdlPeerBaReqSent", counts.peerBaReqSent, 32);
+    setProperty("MtkAwdlPeerBaReqAcked", counts.peerBaReqAcked, 32);
+    setProperty("MtkAwdlPeerBaReqFailed", counts.peerBaReqFailed, 32);
+    setProperty("MtkAwdlPeerBaRxAny", counts.peerBaRxAny, 32);
+    setProperty("MtkAwdlPeerBaRxRespSent", counts.peerBaRxRespSent, 32);
+    setProperty("MtkAwdlPeerBaRxReq", counts.peerBaRxReq, 32);
+    setProperty("MtkAwdlPeerTxSampleBw", counts.peerTxStatus.bw, 32);
+    setProperty("MtkAwdlPeerTxSampleRate", counts.peerTxStatus.rate, 32);
+    setProperty("MtkAwdlPeerTxBaErrorSamples", counts.peerTxStatus.baErrors, 32);
+    setProperty("MtkAwdlPeerTxAmpduSamples", counts.peerTxStatus.ampdu, 32);
+    setProperty("MtkAwdlPeerTxSamples", counts.peerTxStatus.samples, 32);
+    setProperty("MtkAwdlPeerFixedBa", counts.peerFixedBa);
+    setProperty("MtkAwdlPeerRxBaEnabled", counts.peerRxBaEnabled);
+    setProperty("MtkAwdlPeerBaRxTidMask", counts.peerBaRxTidMask, 32);
+    setProperty("MtkAwdlPeerBaRxActiveTidMask", counts.peerBaRxActiveTidMask, 32);
+    setProperty("MtkAwdlPeerBaRxReconfigs", counts.peerBaRxReconfigs, 32);
+    setProperty("MtkAwdlPeerBaRxOtherTid", counts.peerBaRxOtherTid, 32);
+    setProperty("MtkAwdlPeerBw", counts.peerBw, 32);
+    setProperty("MtkAwdlPeerBaRxRejected", counts.peerBaRxRejected, 32);
+    setProperty("MtkAwdlPeerBaRxLastStatus", counts.peerBaRxLastStatus, 32);
+    setProperty("MtkAwdlPeerBaRespOk", counts.peerBaRespOk, 32);
+    setProperty("MtkAwdlPeerBaDelba", counts.peerBaDelba, 32);
+    setProperty("MtkAwdlPeerBaErrors", counts.peerBaErrors, 32);
+    setProperty("MtkAwdlPeerBaLastError", UInt64(counts.peerBaLastError), 64);
     if (!lastCompletions.serviceSent && counts.serviceSent)
         IOLog("MTK AWDL: firmware reported first service announcement sent\n");
     lastCompletions = counts;
@@ -920,8 +1195,16 @@ void MtkAWDLInterface::publishCompletions(AirportItlwm *controller)
 
 void MtkAWDLInterface::syncHardwareMac(AirportItlwm *controller)
 {
-    if (!controller || !nativeStarted || !activeChannel || !workLoop || !workLoop->inGate())
+    if (!controller || !nativeStarted || !workLoop || !workLoop->inGate())
         return;
+    if (!activeChannel || !ipv6Enabled) {
+        if (hardwareMacActive && controller->setAwdlMacAddress(nullptr, false) == kIOReturnSuccess) {
+            hardwareMacActive = false;
+            appliedHardwareMac = 0;
+            setProperty("MtkAwdlDevActive", false);
+        }
+        return;
+    }
     const uint64_t want = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
     if (!want || (hardwareMacActive && appliedHardwareMac == want))
         return;
@@ -946,31 +1229,46 @@ void MtkAWDLInterface::syncIPv6State(AirportItlwm *controller)
     IOLockLock(configurationLock);
     configuration.readSyncEnabled(&request);
     IOLockUnlock(configurationLock);
-    const bool want = activeChannel != 0 && request.enabled != 0;
+    const bool want = dataLinkGrace.shouldRun(activeChannel != 0, request.enabled != 0,
+                                             ipv6Enabled, clockUS());
     if (want && !ipv6Enabled) {
         if (!dataFrames)
             dataFrames = static_cast<DataFrame *>(IOMalloc(sizeof(DataFrame) * dataCapacity));
         if (!dataFrames)
             return;
+        ipv6Enabled = true;
+        txQueueBackpressured = false;
+        nextNdpSyncUS = 0;
         for (auto *q : queues)
             if (q)
                 q->enable();
-        ipv6Enabled = true;
-        nextNdpSyncUS = 0;
         setProperty("MtkAwdlIPv6Enabled", true);
         setProperty("MtkAwdlAutoIPv6", true);
         setProperty("MtkAwdlQueuesEnabled", true);
         setRunningState(true);
+        reportLinkStatus(3, 0x80);
+        (void)itlReportLinkQuality(this, 100);
+        (void)itlReportDataBandwidths(this, 300000000ULL, 300000000ULL, 150000000ULL, 150000000ULL);
+        if (queues[0])
+            (void)itlTxRequestDequeue(queues[0], nullptr, 1);
         IOLog("MTK AWDL: enabled Skywalk queues and IPv6 data plane on channel=%u\n", activeChannel);
     } else if (!want && ipv6Enabled) {
         ipv6Enabled = false;
+        txQueueBackpressured = false;
+        dataActivity = {};
+        dataPause = {};
         dataRejected += dataQueued;
         dataQueued = 0;
         drainDataCompletions();
         for (auto *q : queues)
             if (q)
                 q->disable();
+        reportLinkStatus(1, 0);
+        (void)itlReportLinkQuality(this, 0);
         setRunningState(false);
+        setProperty("MtkAwdlDataLinkDowns", ++dataLinkDowns, 32);
+        setProperty("MtkAwdlDataLinkDownReason", request.enabled ? "radio unavailable" : "sync disabled");
+        IOLog("MTK AWDL: IPv6 link down channel=%u sync=%u\n", activeChannel, request.enabled);
         setProperty("MtkAwdlIPv6Enabled", false);
         setProperty("MtkAwdlQueuesEnabled", false);
     }
@@ -983,7 +1281,6 @@ IOReturn MtkAWDLInterface::enableIPv6(AirportItlwm *controller)
     refreshChannel(controller);
     if (!activeChannel)
         return kIOReturnNotReady;
-    syncHardwareMac(controller);
     if (ipv6Enabled)
         return kIOReturnSuccess;
     if (!dataFrames)
@@ -991,13 +1288,20 @@ IOReturn MtkAWDLInterface::enableIPv6(AirportItlwm *controller)
     if (!dataFrames)
         return kIOReturnNoMemory;
 
+    ipv6Enabled = true;
+    txQueueBackpressured = false;
     for (auto *q : queues)
         if (q)
             q->enable();
-    ipv6Enabled = true;
     setProperty("MtkAwdlIPv6Enabled", true);
     setProperty("MtkAwdlQueuesEnabled", true);
     setRunningState(true);
+    reportLinkStatus(3, 0x80);
+    (void)itlReportLinkQuality(this, 100);
+    (void)itlReportDataBandwidths(this, 300000000ULL, 300000000ULL, 150000000ULL, 150000000ULL);
+    if (queues[0])
+        (void)itlTxRequestDequeue(queues[0], nullptr, 1);
+    syncHardwareMac(controller);
     nextNdpSyncUS = 0;
     syncNeighbors(clockUS());
     return kIOReturnSuccess;
@@ -1009,38 +1313,43 @@ void MtkAWDLInterface::syncNeighbors(uint64_t nowUS)
         return;
     if (ipv6Enabled && nowUS < nextNdpSyncUS)
         return;
-    nextNdpSyncUS = ipv6Enabled ? (nowUS + 1000000ULL) : UINT64_MAX;
+    uint16_t dataPeers = 0;
 
     uint8_t macs[MtkAwdlNdp::kMaxPeers][6] = {};
     size_t count = 0;
     constexpr uint8_t zero[6] = {};
 
+    const auto addPeer = [&](const uint8_t *mac, bool activeData) {
+        for (size_t i = 0; i < count; ++i)
+            if (!memcmp(macs[i], mac, 6))
+                return;
+        if (count < MtkAwdlNdp::kMaxPeers) {
+            if (activeData)
+                dataPeers |= 1u << count;
+            memcpy(macs[count++], mac, 6);
+        }
+    };
     if (ipv6Enabled) {
-        if (memcmp(timingPeer, zero, sizeof(timingPeer)) != 0 && count < MtkAwdlNdp::kMaxPeers) {
-            memcpy(macs[count++], timingPeer, 6);
-        }
-        for (const auto &entry : observedPeers) {
-            if (!entry.frames || (nowUS - entry.lastFrameUS) >= ItlAWDL::kPeerScheduleStaleUS)
-                continue;
-            bool dup = false;
-            for (size_t i = 0; i < count; ++i) {
-                if (memcmp(macs[i], entry.address, 6) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup && count < MtkAwdlNdp::kMaxPeers)
-                memcpy(macs[count++], entry.address, 6);
-        }
+        for (const auto &peer : dataActivity.entries)
+            if (peer.recent(nowUS, MtkAwdl::RecentDataPeers::routeGraceUS))
+                addPeer(peer.mac, true);
+        if (memcmp(timingPeer, zero, sizeof(timingPeer)))
+            addPeer(timingPeer, false);
+        for (const auto &entry : observedPeers)
+            if (entry.frames && nowUS >= entry.lastFrameUS &&
+                nowUS - entry.lastFrameUS < ItlAWDL::kPeerScheduleStaleUS)
+                addPeer(entry.address, false);
     }
 
-    neighbors.updateDesiredState(ipv6Enabled && activeChannel != 0, nowUS * 1000ULL, macs, count);
+    nextNdpSyncUS = ipv6Enabled ? nowUS + 1000000ULL : UINT64_MAX;
+    neighbors.updateDesiredState(ipv6Enabled, nowUS * 1000ULL, macs, count, dataPeers);
     const auto st = neighbors.snapshotStats();
     setProperty("MtkAwdlNdpEnabled", st.enabled);
     setProperty("MtkAwdlNdpRouteOwned", st.routeOwned);
     setProperty("MtkAwdlNdpNeighbors", st.activeNeighbors, 32);
     setProperty("MtkAwdlNdpRouteAdds", st.routeAdds, 32);
     setProperty("MtkAwdlNdpNeighborAdds", st.neighborAdds, 32);
+    setProperty("MtkAwdlNdpReasserts", st.reasserts, 32);
     setProperty("MtkAwdlNdpErrors", st.errors, 32);
 }
 
@@ -1048,10 +1357,15 @@ UInt32 MtkAWDLInterface::acceptTransmit(OSObject *owner, IOSkywalkTxSubmissionQu
                                       IOSkywalkPacket *const *packets, UInt32 count, void *)
 {
     auto *self = static_cast<MtkAWDLInterface *>(owner);
-    if (!self->workLoop || !self->workLoop->inGate() || !self->ipv6Enabled || !packets)
+    if (!self->workLoop || !self->workLoop->inGate() || !packets)
         return 0;
+    if (!self->ipv6Enabled) {
+        self->txQueueBackpressured = true;
+        return 0;
+    }
     unsigned accepted = 0;
-    for (; accepted < count && self->dataDoneCount < dataCapacity; ++accepted) {
+    for (; accepted < count && self->dataDoneCount + self->dataCompletingCount < dataDoneCapacity &&
+           self->dataQueued < dataCapacity; ++accepted) {
         if (!packets[accepted])
             break;
         auto *packet = reinterpret_cast<ItlSkywalkPacketView *>(packets[accepted]);
@@ -1060,7 +1374,7 @@ UInt32 MtkAWDLInterface::acceptTransmit(OSObject *owner, IOSkywalkTxSubmissionQu
         const auto *base = reinterpret_cast<const uint8_t *>(packet->getDataVirtualAddress());
         const bool valid = packet->getPacketBufferCount() == 1 && base && offset < 2048 &&
             length <= 2048U - offset && length >= 54 && length <= MtkAwdl::ethernetMax;
-        if (valid && self->dataQueued < dataCapacity) {
+        if (valid) {
             auto &slot = self->dataFrames[(self->dataHead + self->dataQueued) % dataCapacity];
             slot.length = uint16_t(length);
             memcpy(slot.bytes, base + offset, length);
@@ -1070,22 +1384,85 @@ UInt32 MtkAWDLInterface::acceptTransmit(OSObject *owner, IOSkywalkTxSubmissionQu
         }
         self->dataDone[self->dataDoneCount++] = packets[accepted];
     }
-    self->dataOffered += accepted;
-    if (self->dataOffered <= 4 || (self->dataOffered / 8 != (self->dataOffered - accepted) / 8))
-        self->setProperty("MtkAwdlIPv6SkywalkAccepted", self->dataOffered, 32);
+    if (accepted) {
+        self->dataOffered += accepted;
+        if (self->dataOffered <= 4 || (self->dataOffered / 8 != (self->dataOffered - accepted) / 8))
+            self->setProperty("MtkAwdlIPv6SkywalkAccepted", self->dataOffered, 32);
+        self->scheduleDataPump();
+    }
+    if (accepted < count) {
+        if (!self->txQueueBackpressured) {
+            self->txQueueBackpressured = true;
+            ++self->txQueueStalls;
+            if (self->txQueueStalls <= 8 || !(self->txQueueStalls % 16))
+                self->setProperty("MtkAwdlTxQueueStalls", self->txQueueStalls, 32);
+        }
+        self->scheduleDataPump();
+    }
     return accepted;
+}
+
+void MtkAWDLInterface::resumeTxQueueIfNeeded()
+{
+    if (!ipv6Enabled || !txQueueBackpressured || !queues[0] || isInactive())
+        return;
+    if (dataQueued >= dataCapacity || dataDoneCount + dataCompletingCount >= dataDoneCapacity)
+        return;
+    txQueueBackpressured = false;
+    if (itlTxRequestDequeue(queues[0], nullptr, 1) == kIOReturnSuccess) {
+        ++txQueueWakeups;
+        if (txQueueWakeups <= 8 || !(txQueueWakeups % 16))
+            setProperty("MtkAwdlTxQueueWakeups", txQueueWakeups, 32);
+    } else {
+        txQueueBackpressured = true;
+    }
+}
+
+void MtkAWDLInterface::scheduleDataPump()
+{
+    if (!ipv6Enabled || (!dataDoneCount && (!activeChannel || !dataQueued || dataPause.paused)) ||
+        isInactive())
+        return;
+    if (!dataPump) {
+        if (announcementTimer)
+            announcementTimer->setTimeoutUS(300);
+    } else if (!dataPumpPending) {
+        dataPumpPending = true;
+        dataPump->setTimeoutUS(1);
+    }
+}
+
+void MtkAWDLInterface::dataPumpFired(OSObject *owner, IOTimerEventSource *)
+{
+    auto *self = static_cast<MtkAWDLInterface *>(owner);
+    self->dataPumpPending = false;
+    if (!self->ipv6Enabled || self->isInactive())
+        return;
+    // Return copied Skywalk packets after the submission callback unwinds.
+    self->drainDataCompletions();
+    if (auto *controller = OSDynamicCast(AirportItlwm, self->getProvider()))
+        self->serviceData(controller, clockUS());
+    self->resumeTxQueueIfNeeded();
 }
 
 void MtkAWDLInterface::drainDataCompletions()
 {
-    if (!dataDoneCount)
+    if (!dataDoneCount || dataCompletingCount)
         return;
-    const auto result = itlTxComplete(queues[1], reinterpret_cast<void *const *>(dataDone),
-                                      dataDoneCount, 0);
-    if (result == kIOReturnSuccess)
-        dataDoneCount = 0;
-    else
+    IOSkywalkPacket *completed[dataDoneCapacity];
+    const unsigned count = dataDoneCount;
+    memcpy(completed, dataDone, count * sizeof(*completed));
+    dataCompletingCount = count;
+    dataDoneCount = 0;
+    const auto result = itlTxComplete(queues[1], reinterpret_cast<void *const *>(completed), count, 0);
+    dataCompletingCount = 0;
+    if (result != kIOReturnSuccess) {
+        // Keep any submissions accepted synchronously by the completion call.
+        memmove(dataDone + count, dataDone, dataDoneCount * sizeof(*dataDone));
+        memcpy(dataDone, completed, count * sizeof(*dataDone));
+        dataDoneCount += count;
         setProperty("MtkAwdlIPv6SkywalkCompletionError", uint32_t(result), 32);
+    }
 }
 
 void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
@@ -1093,33 +1470,106 @@ void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
     if (!activeChannel || !dataQueued)
         return;
 
-    // Defer briefly only when we have reliable timing showing the peer is off-channel
-    // and the queue still has plenty of headroom. Never drop queued handshake packets.
-    if (windowEvidence.reliable() && peerSchedule.timingUsable(now, false) &&
-        peerSchedule.shouldPause(now) && dataQueued < dataCapacity / 2)
-        return;
-    const uint64_t address = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
+    MtkAwdl::AnnouncementCompletions counts;
+    const bool haveCounts = controller->readAwdlAnnouncementCompletions(counts);
+    now = clockUS();
+    if (const auto *destination = queuedUnicastPeer())
+        bindTimingPeer(destination, now);
+    if (haveCounts && counts.peerWcidActive)
+        dataActivity.note(counts.peerMac, counts.peerLastDataAckUS);
+    uint32_t inFlight = haveCounts ? counts.dataInFlight : 0;
+    const uint8_t rateIdx = haveCounts ? counts.txRateIdx : 0;
+    const bool wideBa = counts.peerBaState == MtkAwdl::PeerBaState::Active &&
+        (!counts.peerFixedBa || rateIdx >= 7) && counts.peerBw > 20;
+    const uint64_t estPktUS = wideBa ? (counts.peerBw == 80 ? 180ULL : 250ULL) : (rateIdx == 0) ? 2500ULL :
+        (rateIdx <= 2) ? 1200ULL : (rateIdx <= 5) ? 600ULL : 350ULL;
+    const uint32_t maxInFlight = (rateIdx >= 6) ? 16u : 8u;
+    constexpr uint64_t kDataBaseEarlyUS = 6000ULL;
+
     constexpr uint8_t zero[6] = {};
-    const unsigned budget = 12;
+    const bool timingActive = windowEvidence.reliable() && peerSchedule.timingUsable(now, false);
+    const uint64_t earlyUS = kDataBaseEarlyUS + uint64_t(inFlight + 1) * estPktUS;
+    // Pause TX whenever reliable peer timing shows the peer is off our channel or
+    // the hardware TX FIFO would not drain before the peer leaves.
+    const bool wantPause = timingActive &&
+        peerSchedule.shouldPauseData(now, earlyUS, kDataResumeLateUS);
+    const int pauseEdge = dataPause.step(wantPause, now,
+        peerSchedule.pauseLimitDataUS(now, earlyUS, kDataResumeLateUS));
+    if (pauseEdge != 0 && (dataPause.pauses <= 8 || !(dataPause.pauses % 16) || dataPause.forcedResumes)) {
+        setProperty("MtkAwdlDataPauses", dataPause.pauses, 32);
+        setProperty("MtkAwdlDataForcedResumes", dataPause.forcedResumes, 32);
+    }
+    if (dataPause.paused) {
+        ++dataPause.framesHeldBack;
+        if (dataPause.framesHeldBack <= 8 || !(dataPause.framesHeldBack % 64))
+            setProperty("MtkAwdlDataHeldBack", dataPause.framesHeldBack, 32);
+        return;
+    }
+    // A timed-out schedule can still predict "away" here. Let the bounded
+    // probe burst through instead of immediately blocking it a second time.
+    const bool probingAfterPause = dataPause.probeAfterTimeout(wantPause, now);
+    const bool unknownTiming = !timingActive && memcmp(timingPeer, zero, sizeof(timingPeer)) != 0;
+    const uint64_t usUntilAway = timingActive && !probingAfterPause ? peerSchedule.usUntilAway(now) : UINT64_MAX;
+    const bool baWindow = MtkAwdl::baRequestWindow(timingActive && !wantPause &&
+        peerSchedule.presentInEntry(peerSchedule.eawAt(now, nullptr)), now, dataProbe.lastRxUS);
+    const uint64_t address = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
+    const bool probeCanRefill = haveCounts && dataProbe.canRefill(now);
+    const unsigned budget = 48;
     unsigned processed = 0;
+    MtkAwdl::DataTxBatch batch;
     while (dataQueued && processed++ < budget) {
+        if (usUntilAway != UINT64_MAX &&
+            usUntilAway <= kDataBaseEarlyUS + uint64_t(inFlight + 1) * estPktUS)
+            break;
+        if (autoTimingAllowed()) {
+            const auto *destination = queuedUnicastPeer();
+            if (destination && memcmp(destination, timingPeer, 6))
+                break;  // Rebind and recalculate the window at the next pump.
+        }
         const auto &slot = dataFrames[dataHead];
         const auto *ethernet = slot.bytes;
         const bool group = ethernet[0] & 1;
+        const bool probing = probingAfterPause || (unknownTiming && !dataActivity.recent(ethernet, now));
+        if (probing && !probeCanRefill)
+            break;
+        const bool dedicated = !group && haveCounts && counts.peerWcidActive &&
+            !memcmp(ethernet, counts.peerMac, sizeof(counts.peerMac));
+        const bool qos = dedicated && counts.peerBaState != MtkAwdl::PeerBaState::Requested &&
+            counts.peerBaState != MtkAwdl::PeerBaState::Failed;
+        const bool baEligible = dedicated && baWindow && !memcmp(ethernet, timingPeer, sizeof(timingPeer));
+        const auto kind = group ? MtkAwdl::TxKind::GroupData :
+            baEligible ? MtkAwdl::TxKind::DataBaEligible : MtkAwdl::TxKind::Data;
+        const bool aggregate = qos && counts.peerBaState == MtkAwdl::PeerBaState::Active &&
+            (!counts.peerFixedBa || rateIdx >= 6);
+        const auto maxAggregateInFlight = min(32u, unsigned(counts.peerBaWinSize));
+        const auto inFlightLimit = probing ? ItlAWDL::PeerDataProbe::maxInFlight :
+            (aggregate ? maxAggregateInFlight : maxInFlight);
+        if (haveCounts && inFlight >= inFlightLimit)
+            break;
         size_t length = 0;
+        bool clearedEct1 = false;
         const bool valid = slot.length >= 54 && !memcmp(ethernet + 6, &address, 6) &&
             (group ? ethernet[0] == 0x33 && ethernet[1] == 0x33 :
                 memcmp(ethernet, zero, sizeof(zero)) != 0) &&
             MtkAwdl::buildData(ethernet, slot.length, announcementSequence,
-                announcementFrame, sizeof(announcementFrame), length);
+                announcementFrame, sizeof(announcementFrame), length, qos, &clearedEct1);
         const auto result = valid ? controller->transmitAwdlAnnouncement(
-            announcementFrame, length, group ? MtkAwdl::TxKind::GroupData : MtkAwdl::TxKind::Data, activeChannel)
+            announcementFrame, length, kind, activeChannel, batch.doorbell())
             : kIOReturnBadArgument;
         if (result == kIOReturnBusy || result == kIOReturnNotReady)
             break;
         if (result == kIOReturnSuccess) {
+            if (clearedEct1) {
+                ++dataEct1Cleared;
+                if (dataEct1Cleared <= 16 || !(dataEct1Cleared % 16))
+                    setProperty("MtkAwdlEct1Cleared", dataEct1Cleared, 32);
+            }
+            if (probing)
+                dataProbe.lastTxUS = now;
+            batch.submitted();
             ++announcementSequence;
             ++dataTxQueued;
+            ++inFlight;
             dataAckQueued += !group;
             if (dataTxQueued <= 8 || !(dataTxQueued % 8)) {
                 setProperty("MtkAwdlIPv6RadioQueued", dataTxQueued, 32);
@@ -1132,6 +1582,8 @@ void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
         dataHead = (dataHead + 1) % dataCapacity;
         --dataQueued;
     }
+    if (batch.pending)
+        controller->flushAwdlData();
 }
 
 void MtkAWDLInterface::observeData(mbuf_t mbuf, uint32_t channel)
@@ -1182,6 +1634,23 @@ void MtkAWDLInterface::observeData(mbuf_t mbuf, uint32_t channel)
             return;
     } else if (memcmp(destination, &address, 6)) {
         return;
+    }
+
+    const bool fromTimingPeer = !memcmp(view.source, timingPeer, sizeof(timingPeer));
+    const auto rxUS = clockUS();
+    if (fromTimingPeer)
+        dataProbe.lastRxUS = rxUS;
+    if (!(destination[0] & 1) && (fromTimingPeer ||
+        (lastCompletions.peerWcidActive && !memcmp(view.source, lastCompletions.peerMac, 6))))
+        dataActivity.note(view.source, rxUS);
+
+    if (!(destination[0] & 1)) {
+        for (auto &entry : observedPeers) {
+            if (entry.channel == channel && !memcmp(entry.address, view.source, 6)) {
+                entry.lastDataRxUS = rxUS;
+                break;
+            }
+        }
     }
 
     auto *pool = reinterpret_cast<ItlSkywalkPoolView *>(rxPool);
@@ -1241,6 +1710,12 @@ UInt32 MtkAWDLInterface::deferReceive(OSObject *, IOSkywalkRxSubmissionQueue *,
 
 void MtkAWDLInterface::releaseNetwork()
 {
+    if (dataPump) {
+        dataPump->disable();
+        dataPump->cancelTimeout();
+        workLoop->removeEventSource(dataPump);
+        OSSafeReleaseNULL(dataPump);
+    }
     if (announcementTimer) {
         announcementTimer->disable();
         announcementTimer->cancelTimeout();
@@ -1248,7 +1723,7 @@ void MtkAWDLInterface::releaseNetwork()
         OSSafeReleaseNULL(announcementTimer);
     }
     neighbors.destroy();
-    if (workLoop && hardwareMacActive) {
+    if (workLoop) {
         workLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
             auto *self = static_cast<MtkAWDLInterface *>(owner);
             if (auto *controller = OSDynamicCast(AirportItlwm, self->getProvider()))
@@ -1343,10 +1818,51 @@ IOReturn MtkAWDLInterface::initializeNetwork(IO80211Controller *controller,
     setProperty("MtkAwdlInfraChannel", UInt64(0), 32);
     setProperty("MtkAwdlActiveChannel", UInt64(0), 32);
     setProperty("MtkAwdlRadioSyncActive", false);
+    setProperty("MtkAwdlNativeKeepalives", UInt64(0), 32);
+    setProperty("MtkAwdlAdvertisedSocialChannel", UInt64(0), 32);
     setProperty("MtkAwdlSyncEnableCalls", UInt64(0), 32);
     setProperty("MtkAwdlMIRequests", UInt64(0), 32);
     setProperty("MtkAwdlMIAccepted", UInt64(0), 32);
     setProperty("MtkAwdlMIServicesReceived", UInt64(0), 64);
+    setProperty("MtkAwdlWindowSeqPreserved", UInt64(0), 32);
+    setProperty("MtkAwdlIPv6UnicastFirmwareFailed", UInt64(0), 32);
+    setProperty("MtkAwdlPeerWcid", UInt64(0), 32);
+    setProperty("MtkAwdlPeerWcidActive", false);
+    setProperty("MtkAwdlPeerWcidErrors", UInt64(0), 32);
+    setProperty("MtkAwdlPeerWcidLastError", UInt64(0), 64);
+    setProperty("MtkAwdlPeerWcidFailStep", UInt64(0), 32);
+    setProperty("MtkAwdlPeerAggTxSent", UInt64(0), 32);
+    setProperty("MtkAwdlPeerAggTxFailed", UInt64(0), 32);
+    setProperty("MtkAwdlPeerAggLastStatus", UInt64(0), 32);
+    setProperty("MtkAwdlBgScanDeferred", UInt64(0), 32);
+    setProperty("MtkAwdlPeerWtblProfile", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxRejectFilter", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxRejectResponder", UInt64(0), 32);
+    setProperty("MtkAwdlPsfSent", UInt64(0), 32);
+    setProperty("MtkAwdlMiSent", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxRawTxs", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxRawLastWcid", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxRawLastPid", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaState", "idle");
+    setProperty("MtkAwdlPeerBaWinSize", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaReqSent", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaReqAcked", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaReqFailed", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxAny", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxRespSent", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxReq", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxSampleBw", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxSampleRate", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxBaErrorSamples", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxAmpduSamples", UInt64(0), 32);
+    setProperty("MtkAwdlPeerTxSamples", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBw", UInt64(20), 32);
+    setProperty("MtkAwdlPeerBaRxRejected", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRxLastStatus", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaRespOk", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaDelba", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaErrors", UInt64(0), 32);
+    setProperty("MtkAwdlPeerBaLastError", UInt64(0), 64);
     setProperty("MtkAwdlTxFirmwareSent", UInt64(0), 32);
     setProperty("MtkAwdlTxFirmwareFailed", UInt64(0), 32);
     setProperty("MtkAwdlTxFirmwareServiceSent", UInt64(0), 32);
@@ -1381,6 +1897,7 @@ IOReturn MtkAWDLInterface::initializeNetwork(IO80211Controller *controller,
         const IOReturn result = workLoop->addEventSource(queue);
         if (result != kIOReturnSuccess)
             return fail(result);
+        queue->disable();
         ++queuesAdded;
     }
 
@@ -1401,8 +1918,8 @@ IOReturn MtkAWDLInterface::initializeNetwork(IO80211Controller *controller,
     const UInt16 headroom = 0x40;
     memcpy(info.bytes + 0x3c, &headroom, sizeof(headroom));
     put32(0x40, 4);
-    put32(0x48, 1428);
-    put32(0x4c, 1428);
+    put32(0x48, 1484);
+    put32(0x4c, 1484);
     const uint64_t registeredMac = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
     memcpy(info.bytes + 0x108, &registeredMac, sizeof(address));
 
@@ -1417,6 +1934,7 @@ IOReturn MtkAWDLInterface::initializeNetwork(IO80211Controller *controller,
 
     if (auto *airport = OSDynamicCast(AirportItlwm, controller)) {
         airport->readAwdlAnnouncementCompletions(lastCompletions);
+        setProperty("MtkAwdlPeerWtblProfile", lastCompletions.peerWtblProfile, 32);
         peerFirmwareBaseline = lastCompletions.verifiedServiceSent;
     }
     setRunningState(false);
@@ -1428,6 +1946,14 @@ IOReturn MtkAWDLInterface::initializeNetwork(IO80211Controller *controller,
         OSSafeReleaseNULL(announcementTimer);
         setProperty("MtkAwdlTxTimer", false);
     }
+    dataPump = IOTimerEventSource::timerEventSource(this, dataPumpFired);
+    if (dataPump && workLoop->addEventSource(dataPump) != kIOReturnSuccess)
+        OSSafeReleaseNULL(dataPump);
+    setProperty("MtkAwdlDataFastPump", dataPump != nullptr);
+    setProperty("MtkAwdlDataLinkDowns", UInt64(0), 32);
+    setProperty("MtkAwdlTxQueueStalls", UInt64(0), 32);
+    setProperty("MtkAwdlTxQueueWakeups", UInt64(0), 32);
+    setProperty("MtkAwdlEct1Cleared", UInt64(0), 32);
     stage("registered");
     registerService();
     return kIOReturnSuccess;

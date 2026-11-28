@@ -219,7 +219,7 @@ int MtkAwdlNeighborManager::programNeighborHost(uint8_t rtmType, uint32_t ifInde
 }
 
 void MtkAwdlNeighborManager::updateDesiredState(bool awdlActive, uint64_t nowNS,
-                                                const uint8_t (*peerMacs)[6], size_t peerCount)
+                                                const uint8_t (*peerMacs)[6], size_t peerCount, uint16_t dataPeers)
 {
     if (!initialized || !enabled || !lock || !workCall)
         return;
@@ -232,8 +232,10 @@ void MtkAwdlNeighborManager::updateDesiredState(bool awdlActive, uint64_t nowNS,
     desiredActive = awdlActive;
     latestNowNS = nowNS ? nowNS : monotonicNS();
 
+    for (auto &slot : peers)
+        slot.activeData = false;
     if (awdlActive && peerMacs) {
-        for (size_t i = 0; i < peerCount; ++i) {
+        for (size_t i = 0; i < peerCount && i < MtkAwdlNdp::kMaxPeers; ++i) {
             const uint8_t *mac = peerMacs[i];
             if (!mac || (mac[0] & 1))
                 continue;
@@ -245,30 +247,27 @@ void MtkAwdlNeighborManager::updateDesiredState(bool awdlActive, uint64_t nowNS,
 
             int freeIdx = -1;
             int foundIdx = -1;
-            int oldestIdx = 0;
             for (int s = 0; s < static_cast<int>(MtkAwdlNdp::kMaxPeers); ++s) {
                 if (peers[s].used) {
                     if (memcmp(peers[s].mac, mac, 6) == 0) {
                         foundIdx = s;
                         break;
                     }
-                    if (peers[s].lastSeenNS < peers[oldestIdx].lastSeenNS)
-                        oldestIdx = s;
                 } else if (freeIdx < 0) {
                     freeIdx = s;
                 }
             }
-            const int target = (foundIdx >= 0) ? foundIdx : (freeIdx >= 0 ? freeIdx : oldestIdx);
+            // Let runPass retire expired routes before reusing their slots.
+            const int target = foundIdx >= 0 ? foundIdx : freeIdx;
+            if (target < 0)
+                continue;
             if (foundIdx < 0) {
-                if (peers[target].used && peers[target].owned && peers[target].ifIndex) {
-                    // Mark old entry for eviction if table full.
-                    peers[target].owned = false;
-                }
                 peers[target] = {};
                 peers[target].used = true;
                 memcpy(peers[target].mac, mac, 6);
             }
             peers[target].lastSeenNS = latestNowNS;
+            peers[target].activeData |= (dataPeers & (1u << i)) != 0;
         }
     }
     IOLockUnlock(lock);
@@ -290,24 +289,22 @@ void MtkAwdlNeighborManager::runPass()
 
     PeerSlot snapshot[MtkAwdlNdp::kMaxPeers] = {};
     bool wantActive = false;
-    bool wasPrefixOwned = false;
+    MtkAwdlNdp::RoutePresence prefix;
     uint32_t prevIfIndex = 0;
     uint64_t nowNS = 0;
-    uint32_t passNum = 0;
 
     IOLockLock(lock);
     wantActive = desiredActive && !stopping && enabled && liveIfIndex != 0;
-    wasPrefixOwned = prefixOwned;
+    prefix = prefixRoute;
     prevIfIndex = currentIfIndex;
     nowNS = latestNowNS ? latestNowNS : monotonicNS();
-    passNum = ++stats.passes;
+    ++stats.passes;
 
     if (prevIfIndex && liveIfIndex != prevIfIndex) {
         // Interface re-attached under a new ifIndex: kernel dropped prior entries.
-        prefixOwned = false;
-        wasPrefixOwned = false;
+        prefix = {};
         for (auto &slot : peers) {
-            slot.owned = false;
+            slot.route = {};
             slot.ifIndex = 0;
         }
     }
@@ -315,18 +312,13 @@ void MtkAwdlNeighborManager::runPass()
     memcpy(snapshot, peers, sizeof(snapshot));
     IOLockUnlock(lock);
 
-    const bool refresh = (passNum % MtkAwdlNdp::kRefreshIntervalPasses) == 0;
-    bool nextPrefixOwned = wasPrefixOwned;
-
     if (wantActive) {
-        if (!wasPrefixOwned || refresh) {
-            int err = programPrefixRoute(RTM_ADD, liveIfIndex);
-            if (err == 0) {
-                nextPrefixOwned = true;
+        if (!prefix.present) {
+            const int err = programPrefixRoute(RTM_ADD, liveIfIndex);
+            prefix = MtkAwdlNdp::addedRoute(err, EEXIST);
+            if (prefix.owned)
                 stats.routeAdds++;
-            } else if (err == EEXIST) {
-                // Pre-existing route is shared cleanly, never claim ownership unless owned.
-            } else {
+            if (!prefix.present) {
                 stats.errors++;
                 stats.lastErrno = err;
             }
@@ -337,60 +329,66 @@ void MtkAwdlNeighborManager::runPass()
             const bool expired = (nowNS >= slot.lastSeenNS) &&
                                  ((nowNS - slot.lastSeenNS) >= MtkAwdlNdp::kPeerIdleExpireNS);
             if (expired) {
-                if (slot.owned && slot.ifIndex == liveIfIndex) {
+                if (slot.route.owned && slot.ifIndex == liveIfIndex) {
                     (void)programNeighborHost(RTM_DELETE, liveIfIndex, slot.mac);
                     stats.neighborDeletes++;
                 }
                 slot = {};
                 continue;
             }
-            if (!slot.owned || slot.ifIndex != liveIfIndex || refresh) {
-                int err = programNeighborHost(RTM_ADD, liveIfIndex, slot.mac);
-                if (err == EEXIST) {
-                    (void)programNeighborHost(RTM_DELETE, liveIfIndex, slot.mac);
-                    err = programNeighborHost(RTM_ADD, liveIfIndex, slot.mac);
-                }
-                if (err == 0) {
-                    slot.owned = true;
-                    slot.ifIndex = liveIfIndex;
-                    stats.neighborAdds++;
-                } else {
-                    stats.errors++;
+            if (MtkAwdlNdp::shouldAddHost(slot.route, slot.activeData, slot.ifIndex == liveIfIndex)) {
+                if (slot.ifIndex != liveIfIndex)
+                    slot.route = {};
+                const int err = programNeighborHost(RTM_ADD, liveIfIndex, slot.mac);
+                const bool restored = MtkAwdlNdp::noteHostAdd(slot.route, err, EEXIST);
+                if (!err) {
+                    ++stats.neighborAdds;
+                    stats.reasserts += restored;
+                } else if (err != EEXIST) {
+                    ++stats.errors;
                     stats.lastErrno = err;
                 }
+                slot.ifIndex = slot.route.present ? liveIfIndex : 0;
             }
         }
     } else {
         for (auto &slot : snapshot) {
-            if (slot.used && slot.owned && slot.ifIndex && liveIfIndex == slot.ifIndex) {
+            if (slot.used && slot.route.owned && slot.ifIndex && liveIfIndex == slot.ifIndex) {
                 (void)programNeighborHost(RTM_DELETE, slot.ifIndex, slot.mac);
                 stats.neighborDeletes++;
             }
             slot = {};
         }
-        if (wasPrefixOwned && prevIfIndex && (!liveIfIndex || liveIfIndex == prevIfIndex)) {
+        if (prefix.owned && prevIfIndex && (!liveIfIndex || liveIfIndex == prevIfIndex)) {
             (void)programPrefixRoute(RTM_DELETE, prevIfIndex);
         }
-        nextPrefixOwned = false;
+        prefix = {};
     }
 
     uint32_t activeCount = 0;
     IOLockLock(lock);
-    prefixOwned = nextPrefixOwned;
+    prefixRoute = prefix;
     for (size_t i = 0; i < MtkAwdlNdp::kMaxPeers; ++i) {
         if (!wantActive) {
             peers[i] = {};
-        } else if (!snapshot[i].used && peers[i].used && peers[i].lastSeenNS <= nowNS &&
-                   (nowNS - peers[i].lastSeenNS) >= MtkAwdlNdp::kPeerIdleExpireNS) {
-            peers[i] = {};
+        } else if (!snapshot[i].used && peers[i].used) {
+            if (peers[i].lastSeenNS <= nowNS &&
+                (nowNS - peers[i].lastSeenNS) >= MtkAwdlNdp::kPeerIdleExpireNS) {
+                peers[i] = {};
+            } else {
+                // A concurrent observation may have refreshed an expired peer
+                // while its route was being removed outside the lock.
+                peers[i].route = {};
+                peers[i].ifIndex = 0;
+            }
         } else if (snapshot[i].used && memcmp(peers[i].mac, snapshot[i].mac, 6) == 0) {
-            peers[i].owned = snapshot[i].owned;
+            peers[i].route = snapshot[i].route;
             peers[i].ifIndex = snapshot[i].ifIndex;
         }
-        if (peers[i].used && peers[i].owned)
+        if (peers[i].used && peers[i].route.present)
             activeCount++;
     }
-    stats.routeOwned = prefixOwned;
+    stats.routeOwned = prefixRoute.owned;
     stats.activeNeighbors = activeCount;
     IOLockUnlock(lock);
 }
