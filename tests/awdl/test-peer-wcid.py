@@ -431,8 +431,8 @@ static void testBandwidthAndSequence()
             StationUpdate::Associate, width, profile);
         assert(length == 92 && wire[2] == 6 && wire[88] == 2 && wire[89] == 0x12);
         assert(wire[35] == (value ? 0x1b : 0) && wire[60] == (value ? 0x63 : 0) &&
-            wire[61] == (value ? 1 : 0));
-        assert(wire[68] == (value ? 0x30 : 0x10) && wire[69] == (value ? 1 : 0) &&
+            wire[61] == 0);
+        assert(wire[68] == (value ? 0x30 : 0x10) && wire[69] == 0 &&
             wire[70] == (value ? 0x80 : 0) && wire[71] == (value ? 3 : 0));
         assert(wire[72] == 0xfa && wire[74] == 0xfa);
     }
@@ -467,21 +467,25 @@ static void testBandwidthAndSequence()
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, narrow20, StationConfig{capHtWideLdpc, false, false}) == 176);
     assert(wire[60] == 0x01 && wire[61] == 0);
 
-    // Bit 2: STA_REC_HT SGI20/40 + RX STBC 1 (0x0160 on 80 MHz, 0x0120 on 20 MHz).
+    // Bit 2: STA_REC_HT SGI20/40 without RX STBC (0x0060 on 80 MHz, 0x0020 on 20 MHz).
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, StationConfig{capHtSgiStbc, false, false}) == 176);
-    assert(wire[35] == 0 && wire[60] == 0x60 && wire[61] == 0x01 && wire[68] == 0x10 && wire[149] == 0);
+    assert(wire[35] == 0 && wire[60] == 0x60 && wire[61] == 0x00 && wire[68] == 0x10 && wire[149] == 0);
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, narrow20, StationConfig{capHtSgiStbc, false, false}) == 176);
-    assert(wire[60] == 0x20 && wire[61] == 0x01);
+    assert(wire[60] == 0x20 && wire[61] == 0x00);
 
     // Bit 3: STA_REC_VHT conservative A-MPDU exp 3 (0x01800010).
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, StationConfig{capVhtAmpdu3, false, false}) == 176);
     assert(wire[35] == 0 && wire[60] == 0 && wire[68] == 0x10 && wire[69] == 0 && wire[70] == 0x80 && wire[71] == 0x01 && wire[149] == 0);
 
-    // Bit 4: STA_REC_VHT SGI80 + RX STBC 1 + exp 7 (0x03800130 on 80 MHz, 0x03800110 on 20 MHz).
+    // Bit 4: STA_REC_VHT SGI80 + exp 7 without RX STBC (0x03800030 on 80 MHz, 0x03800010 on 20 MHz).
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, StationConfig{capVhtSgiStbcExp7, false, false}) == 176);
-    assert(wire[35] == 0 && wire[60] == 0 && wire[68] == 0x30 && wire[69] == 0x01 && wire[70] == 0x80 && wire[71] == 0x03 && wire[149] == 0);
+    assert(wire[35] == 0 && wire[60] == 0 && wire[68] == 0x30 && wire[69] == 0x00 && wire[70] == 0x80 && wire[71] == 0x03 && wire[149] == 0);
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, narrow20, StationConfig{capVhtSgiStbcExp7, false, false}) == 176);
-    assert(wire[68] == 0x10 && wire[69] == 0x01 && wire[70] == 0x80 && wire[71] == 0x03);
+    assert(wire[68] == 0x10 && wire[69] == 0x00 && wire[70] == 0x80 && wire[71] == 0x03);
+
+    // Default station config enables AP-role BSS + STBC-free full capabilities + matchingSco.
+    const auto defCfg = defaultStationConfig();
+    assert(defCfg.capMask == capMaskAll && defCfg.matchingSco && !defCfg.twoStage && !defCfg.bssConnected && defCfg.apRole && defCfg.raFixed == 0);
 
     // Bit 5: WTBL_HT (ldpc/af/mm) + WTBL_VHT (ldpc) only.
     assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, StationConfig{capWtblEnhanced, false, false}) == 176);
@@ -506,6 +510,34 @@ static void testBandwidthAndSequence()
     assert(makeRlmRequest(157, 2, 3, width, StationConfig{0, true, false}).rlm.secondaryOffset == 3);
     assert(makeRlmRequest(149, 2, 3, w80_149, StationConfig{0, false, false}).rlm.secondaryOffset == 1);
     assert(makeRlmRequest(149, 2, 3, w80_149, StationConfig{0, true, false}).rlm.secondaryOffset == 1);
+
+    // bssConnected (conn_state=0, bcn=100, dtim=1, aid=1) and apRole (AP BSS + STA peer).
+    const StationConfig connCfg{0x3b, true, true, true, false, 0};
+    const auto connBss = makeBssRequest(firstMac, 157, 2, true, connCfg);
+    assert(connBss.basic.conn_state == 0 && connBss.basic.bcn_interval == 100 && connBss.basic.dtim_period == 1);
+    assert(connBss.basic.conn_type == (STA_TYPE_STA | NETWORK_INFRA));
+    const auto disconnBss = makeBssRequest(firstMac, 157, 2, false, connCfg);
+    assert(disconnBss.basic.conn_state == 1 && disconnBss.basic.bcn_interval == 0);
+    assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, connCfg) == 88);
+    assert(wire[18] == 0 && wire[19] == 0);  // twoStage Create keeps aid=0
+    assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Associate, width, connCfg) == 92);
+    assert(wire[18] == 1 && wire[19] == 0);  // Associate sets aid=1
+
+    const StationConfig apCfg{0x3b, true, false, false, true, 0};
+    const auto apBss = makeBssRequest(nextMac, 157, 2, true, apCfg);
+    assert(apBss.basic.conn_type == (STA_TYPE_AP | NETWORK_INFRA) && apBss.basic.conn_state == 0);
+    assert(!memcmp(apBss.basic.bssid, nextMac, 6));
+    assert(buildStationRequest(wire, firstMac, 157, true, StationUpdate::Create, width, apCfg) == 176);
+    assert(wire[12] == 1 && wire[14] == 1 && wire[18] == 1);  // STA_TYPE_STA | NETWORK_INFRA, aid=1
+
+    // STA_REC_RA_UPDATE fixed rate request wire format.
+    const auto ra9 = makeRaFixedRequest(157, true, width, 3);
+    static_assert(sizeof(ra9.ra) == 25, "sta_rec_ra_fixed must match mt76 wire layout");
+    assert(ra9.ra.tag == staRecRaUpdateTag && ra9.ra.len == 25 && ra9.ra.field == rateParamFixed);
+    assert(ra9.ra.phy.type == MT_PHY_TYPE_VHT && ra9.ra.phy.bw == CMD_CBW_80MHZ &&
+        ra9.ra.phy.ldpc == 1 && ra9.ra.phy.mcs == 9 && ra9.ra.phy.nss == 2 && ra9.ra.is_5g == 1);
+    const auto ra40 = makeRaFixedRequest(157, true, forty, 3);
+    assert(ra40.ra.phy.bw == CMD_CBW_40MHZ && ra40.ra.phy.mcs == 8);  // MCS9 clamped to MCS8 below 80 MHz
 }
 
 static void testBaWireFormat()

@@ -1109,6 +1109,10 @@ void MtkAWDLInterface::publishCompletions(AirportItlwm *controller)
          counts.peerCapMask == lastCompletions.peerCapMask &&
          counts.peerMatchingSco == lastCompletions.peerMatchingSco &&
          counts.peerTwoStage == lastCompletions.peerTwoStage &&
+         counts.peerBssConnected == lastCompletions.peerBssConnected &&
+         counts.peerApRole == lastCompletions.peerApRole &&
+         counts.peerRaFixed == lastCompletions.peerRaFixed &&
+         counts.peerRaFixedStatus == lastCompletions.peerRaFixedStatus &&
          counts.peerTuneGen == lastCompletions.peerTuneGen &&
          counts.peerBaRxRejectFilter == lastCompletions.peerBaRxRejectFilter &&
          counts.peerBaRxRejectResponder == lastCompletions.peerBaRxRejectResponder &&
@@ -1151,6 +1155,10 @@ void MtkAWDLInterface::publishCompletions(AirportItlwm *controller)
     setProperty("MtkAwdlPeerCapMask", counts.peerCapMask, 32);
     setProperty("MtkAwdlPeerMatchingSco", counts.peerMatchingSco);
     setProperty("MtkAwdlPeerTwoStage", counts.peerTwoStage);
+    setProperty("MtkAwdlPeerBssConnected", counts.peerBssConnected);
+    setProperty("MtkAwdlPeerApRole", counts.peerApRole);
+    setProperty("MtkAwdlPeerRaFixed", counts.peerRaFixed, 32);
+    setProperty("MtkAwdlPeerRaFixedStatus", UInt64(counts.peerRaFixedStatus), 64);
     setProperty("MtkAwdlPeerTuneGeneration", counts.peerTuneGen, 32);
     setProperty("MtkAwdlPeerBaRxRejectFilter", counts.peerBaRxRejectFilter, 32);
     setProperty("MtkAwdlPeerBaRxRejectResponder", counts.peerBaRxRejectResponder, 32);
@@ -1481,20 +1489,22 @@ void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
     const uint8_t rateIdx = haveCounts ? counts.txRateIdx : 0;
     const bool wideBa = counts.peerBaState == MtkAwdl::PeerBaState::Active &&
         (!counts.peerFixedBa || rateIdx >= 7) && counts.peerBw > 20;
-    const uint64_t estPktUS = wideBa ? (counts.peerBw == 80 ? 180ULL : 250ULL) : (rateIdx == 0) ? 2500ULL :
+    const bool fast80Ba = wideBa && counts.peerBw == 80 && !counts.peerFixedBa;
+    const uint64_t estPktUS = fast80Ba ? 45ULL : wideBa ? (counts.peerBw == 80 ? 180ULL : 250ULL) : (rateIdx == 0) ? 2500ULL :
         (rateIdx <= 2) ? 1200ULL : (rateIdx <= 5) ? 600ULL : 350ULL;
     const uint32_t maxInFlight = (rateIdx >= 6) ? 16u : 8u;
-    constexpr uint64_t kDataBaseEarlyUS = 6000ULL;
+    const uint64_t baseEarlyUS = fast80Ba ? 3000ULL : 6000ULL;
+    const uint64_t resumeLateUS = fast80Ba ? 1500ULL : kDataResumeLateUS;
 
     constexpr uint8_t zero[6] = {};
     const bool timingActive = windowEvidence.reliable() && peerSchedule.timingUsable(now, false);
-    const uint64_t earlyUS = kDataBaseEarlyUS + uint64_t(inFlight + 1) * estPktUS;
+    const uint64_t earlyUS = baseEarlyUS + uint64_t(inFlight + 1) * estPktUS;
     // Pause TX whenever reliable peer timing shows the peer is off our channel or
     // the hardware TX FIFO would not drain before the peer leaves.
     const bool wantPause = timingActive &&
-        peerSchedule.shouldPauseData(now, earlyUS, kDataResumeLateUS);
+        peerSchedule.shouldPauseData(now, earlyUS, resumeLateUS);
     const int pauseEdge = dataPause.step(wantPause, now,
-        peerSchedule.pauseLimitDataUS(now, earlyUS, kDataResumeLateUS));
+        peerSchedule.pauseLimitDataUS(now, earlyUS, resumeLateUS));
     if (pauseEdge != 0 && (dataPause.pauses <= 8 || !(dataPause.pauses % 16) || dataPause.forcedResumes)) {
         setProperty("MtkAwdlDataPauses", dataPause.pauses, 32);
         setProperty("MtkAwdlDataForcedResumes", dataPause.forcedResumes, 32);
@@ -1514,12 +1524,12 @@ void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
         peerSchedule.presentInEntry(peerSchedule.eawAt(now, nullptr)), now, dataProbe.lastRxUS);
     const uint64_t address = __atomic_load_n(&requestedMac, __ATOMIC_RELAXED);
     const bool probeCanRefill = haveCounts && dataProbe.canRefill(now);
-    const unsigned budget = 48;
+    const unsigned budget = fast80Ba ? 64u : 48u;
     unsigned processed = 0;
     MtkAwdl::DataTxBatch batch;
     while (dataQueued && processed++ < budget) {
         if (usUntilAway != UINT64_MAX &&
-            usUntilAway <= kDataBaseEarlyUS + uint64_t(inFlight + 1) * estPktUS)
+            usUntilAway <= baseEarlyUS + uint64_t(inFlight + 1) * estPktUS)
             break;
         if (autoTimingAllowed()) {
             const auto *destination = queuedUnicastPeer();
@@ -1541,7 +1551,7 @@ void MtkAWDLInterface::serviceData(AirportItlwm *controller, uint64_t now)
             baEligible ? MtkAwdl::TxKind::DataBaEligible : MtkAwdl::TxKind::Data;
         const bool aggregate = qos && counts.peerBaState == MtkAwdl::PeerBaState::Active &&
             (!counts.peerFixedBa || rateIdx >= 6);
-        const auto maxAggregateInFlight = min(32u, unsigned(counts.peerBaWinSize));
+        const auto maxAggregateInFlight = min(fast80Ba ? 56u : 32u, unsigned(counts.peerBaWinSize));
         const auto inFlightLimit = probing ? ItlAWDL::PeerDataProbe::maxInFlight :
             (aggregate ? maxAggregateInFlight : maxInFlight);
         if (haveCounts && inFlight >= inFlightLimit)

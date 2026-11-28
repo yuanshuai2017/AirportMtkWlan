@@ -50,27 +50,6 @@ struct BssRequest {
     mt76_connac_bss_basic_tlv basic;
 } __packed;
 
-inline BssRequest makeBssRequest(const uint8_t *peerMac, uint8_t channel, uint8_t wmm, bool enable) {
-    BssRequest req = {};
-    req.index = bssIndex;
-    req.basic.tag = htole16(UNI_BSS_INFO_BASIC);
-    req.basic.len = htole16(sizeof(req.basic));
-    req.basic.active = enable;
-    req.basic.omac_idx = HW_BSSID_1;
-    req.basic.hw_bss_idx = HW_BSSID_1;
-    req.basic.conn_type = htole32(bssConnectionType);
-    // Allocate the BSS without asserting a beacon-synchronized association.
-    req.basic.conn_state = 1;
-    req.basic.wmm_idx = wmm;
-    memcpy(req.basic.bssid, peerMac, sizeof(req.basic.bssid));
-    req.basic.bmc_tx_wlan_idx = htole16(bmcWcid);
-    req.basic.sta_idx = htole16(bmcWcid);
-    req.basic.phymode = channel >= 36 ? 0x31 : 0x0e;  // A/AN/AC or B/G/GN.
-    req.basic.nonht_basic_phy = htole16(channel >= 36 ? PHY_TYPE_BIT_OFDM :
-        PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP);
-    return req;
-}
-
 struct ChannelWidth {
     uint8_t code = CMD_CBW_20MHZ;
     uint8_t center = 0;
@@ -118,25 +97,39 @@ inline WtblProfile wtblProfileFromBootArg(int value) {
 }
 
 // 6-bit independent STA/WTBL capability mask (splits legacy `enhanced`).
+// Note: HT/VHT RX STBC 1 is intentionally omitted because Connac2 firmware
+// emits STBC rate entries (0x2487/0x2507) on HW_BSSID_1 that LMAC drops
+// silently (Agg=0/N, TxRawTxs=0).
 constexpr uint8_t capPhyAmpdu       = 1u << 0;  // 0x01: STA_REC_PHY.ampdu = 0x1b
 constexpr uint8_t capHtWideLdpc     = 1u << 1;  // 0x02: STA_REC_HT LDPC + 20/40
-constexpr uint8_t capHtSgiStbc      = 1u << 2;  // 0x04: STA_REC_HT SGI20/40 + RX STBC 1
+constexpr uint8_t capHtSgiStbc      = 1u << 2;  // 0x04: STA_REC_HT SGI20/40 (STBC stripped)
 constexpr uint8_t capVhtAmpdu3      = 1u << 3;  // 0x08: STA_REC_VHT conservative A-MPDU exp 3
-constexpr uint8_t capVhtSgiStbcExp7 = 1u << 4;  // 0x10: STA_REC_VHT SGI80 + RX STBC 1 + exp 7
+constexpr uint8_t capVhtSgiStbcExp7 = 1u << 4;  // 0x10: STA_REC_VHT SGI80 + exp 7 (STBC stripped)
 constexpr uint8_t capWtblEnhanced   = 1u << 5;  // 0x20: WTBL_HT (ldpc/af/mm) + WTBL_VHT (ldpc)
 constexpr uint8_t capMaskAll        = 0x3f;
+constexpr uint8_t raFixedMax        = 4;
 
 struct StationConfig {
     uint8_t capMask = 0;
     bool matchingSco = false;
     bool twoStage = false;
+    bool bssConnected = false;  // UNI_BSS_INFO_BASIC conn_state=0 + bcn=100 + dtim=1 + STA_REC_BASIC aid=1
+    bool apRole = false;        // AP-role BSS (STA_TYPE_AP) + STA-role peer (STA_TYPE_STA), conn_state=0, aid=1
+    uint8_t raFixed = 0;        // 0=auto, 1=UNI MCS7, 2=UNI MCS8, 3=UNI MCS9, 4=EXT MCS9
 
     bool operator==(const StationConfig &other) const {
         return capMask == other.capMask && matchingSco == other.matchingSco &&
-            twoStage == other.twoStage;
+            twoStage == other.twoStage && bssConnected == other.bssConnected &&
+            apRole == other.apRole && raFixed == other.raFixed;
     }
     bool operator!=(const StationConfig &other) const { return !(*this == other); }
 };
+
+inline StationConfig defaultStationConfig() {
+    // Verified 80 MHz VHT + hardware A-MPDU default (AP-role BSS avoids beacon-loss timeout,
+    // STBC-free capabilities enable SGI80 + 1 MB A-MPDU exp 7 with 0% TX failure).
+    return {capMaskAll, true, false, false, true, 0};
+}
 
 inline StationConfig stationConfigFromProfile(WtblProfile profile) {
     switch (profile) {
@@ -146,6 +139,33 @@ inline StationConfig stationConfigFromProfile(WtblProfile profile) {
     case WtblProfile::Baseline:
     default:                       return {0, false, false};
     }
+}
+
+inline BssRequest makeBssRequest(const uint8_t *bssid, uint8_t channel, uint8_t wmm, bool enable,
+                                 StationConfig config = {}) {
+    const bool connected = enable && (config.bssConnected || config.apRole);
+    BssRequest req = {};
+    req.index = bssIndex;
+    req.basic.tag = htole16(UNI_BSS_INFO_BASIC);
+    req.basic.len = htole16(sizeof(req.basic));
+    req.basic.active = enable;
+    req.basic.omac_idx = HW_BSSID_1;
+    req.basic.hw_bss_idx = HW_BSSID_1;
+    req.basic.conn_type = htole32(config.apRole ? (STA_TYPE_AP | NETWORK_INFRA) : bssConnectionType);
+    // conn_state: 0 = CONNECTED, 1 = DISCONNECTED (inverted vs STA_REC_BASIC).
+    req.basic.conn_state = connected ? 0 : 1;
+    req.basic.wmm_idx = wmm;
+    memcpy(req.basic.bssid, bssid, sizeof(req.basic.bssid));
+    req.basic.bmc_tx_wlan_idx = htole16(bmcWcid);
+    req.basic.sta_idx = htole16(bmcWcid);
+    if (connected) {
+        req.basic.bcn_interval = htole16(100);
+        req.basic.dtim_period = 1;
+    }
+    req.basic.phymode = channel >= 36 ? 0x31 : 0x0e;  // A/AN/AC or B/G/GN.
+    req.basic.nonht_basic_phy = htole16(channel >= 36 ? PHY_TYPE_BIT_OFDM :
+        PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP);
+    return req;
 }
 
 struct RlmRequest {
@@ -223,9 +243,11 @@ inline size_t buildStationRequest(uint8_t (&buffer)[staRequestMax], const uint8_
     append(out, header);
 
     sta_rec_basic basic = {htole16(STA_REC_BASIC), htole16(sizeof(basic))};
-    basic.conn_type = htole32(peerConnectionType);
+    basic.conn_type = htole32(config.apRole ? (STA_TYPE_STA | NETWORK_INFRA) : peerConnectionType);
     basic.conn_state = enable ? CONN_STATE_PORT_SECURE : CONN_STATE_DISCONNECT;
     basic.qos = enable;
+    if (enable && (config.bssConnected || config.apRole) && (!create || !config.twoStage))
+        basic.aid = htole16(1);
     memcpy(basic.peer_addr, mac, sizeof(basic.peer_addr));
     basic.extra_info = htole16(EXTRA_INFO_VER | (create ? EXTRA_INFO_NEW : 0));
     append(out, basic);
@@ -249,7 +271,7 @@ inline size_t buildStationRequest(uint8_t (&buffer)[staRequestMax], const uint8_
         if (caps & capHtWideLdpc)
             htCap |= 0x0001u | (width.code != CMD_CBW_20MHZ ? 0x0002u : 0u);  // LDPC, 20/40.
         if (caps & capHtSgiStbc)
-            htCap |= 0x0020u | 0x0100u | (width.code != CMD_CBW_20MHZ ? 0x0040u : 0u);  // SGI20, RX STBC 1, SGI40.
+            htCap |= 0x0020u | (width.code != CMD_CBW_20MHZ ? 0x0040u : 0u);  // SGI20, SGI40 (no RX STBC).
         ht.ht_cap = htole16(htCap);
         append(out, ht);
         if (vht) {
@@ -257,7 +279,7 @@ inline size_t buildStationRequest(uint8_t (&buffer)[staRequestMax], const uint8_
             // MCS 0–9 at 80 MHz and MCS 0–8 on the narrower profiles.
             uint32_t vhtCap = (1u << 4);
             if (caps & capVhtSgiStbcExp7)
-                vhtCap |= (1u << 8) | (7u << 23) | (mcs9 ? (1u << 5) : 0u);
+                vhtCap |= (7u << 23) | (mcs9 ? (1u << 5) : 0u);  // exp 7 + SGI80 (no RX STBC).
             else if (caps & capVhtAmpdu3)
                 vhtCap |= (3u << 23);
             vhtRec.vht_cap = htole32(vhtCap);
@@ -495,6 +517,57 @@ inline StaBaRequest makeStaBa(uint16_t ssn, uint16_t window, bool enable,
     request.ba.ssn = htole16(enable ? ssn : 0);
     request.ba.winsize = htole16(enable ? window : 0);
     return request;
+}
+
+constexpr uint16_t staRecRaUpdateTag = 0x03;
+constexpr uint32_t rateParamFixed = 3;
+
+struct RaFixedRequest {
+    sta_req_hdr header;
+    struct {
+        uint16_t tag;
+        uint16_t len;
+        uint32_t field;
+        uint8_t op_mode;
+        uint8_t op_vht_chan_width;
+        uint8_t op_vht_rx_nss;
+        uint8_t op_vht_rx_nss_type;
+        struct {
+            uint8_t type;
+            uint8_t flag;
+            uint8_t stbc;
+            uint8_t sgi;
+            uint8_t bw;
+            uint8_t ldpc;
+            uint8_t mcs;
+            uint8_t nss;
+            uint8_t he_ltf;
+        } __packed phy;
+        uint8_t spe_idx;
+        uint8_t short_preamble;
+        uint8_t is_5g;
+        uint8_t mmps_mode;
+    } __packed ra;
+} __packed;
+
+inline RaFixedRequest makeRaFixedRequest(uint8_t channel, bool twoStreams, ChannelWidth width, uint8_t raFixed) {
+    RaFixedRequest req = {};
+    req.header = baRequestHeader();
+    req.ra.tag = htole16(staRecRaUpdateTag);
+    req.ra.len = htole16(sizeof(req.ra));
+    req.ra.field = htole32(rateParamFixed);
+    const bool vht = channel >= 36;
+    const uint8_t maxMcs = width.code == CMD_CBW_80MHZ ? 9 : 8;
+    uint8_t mcs = raFixed == 1 ? 7 : raFixed == 2 ? 8 : 9;
+    if (mcs > maxMcs)
+        mcs = maxMcs;
+    req.ra.phy.type = vht ? MT_PHY_TYPE_VHT : MT_PHY_TYPE_HT;
+    req.ra.phy.bw = width.code;
+    req.ra.phy.ldpc = 1;
+    req.ra.phy.mcs = vht ? mcs : 7;
+    req.ra.phy.nss = twoStreams ? 2 : 1;
+    req.ra.is_5g = vht ? 1 : 0;
+    return req;
 }
 
 struct Slot {

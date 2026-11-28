@@ -54,14 +54,28 @@ static bool readAwdlTuneBool(OSObject *obj, bool &out)
     return false;
 }
 
+static void formatU32Words(char *buf, size_t cap, const uint32_t *words, unsigned count)
+{
+    size_t pos = 0;
+    buf[0] = '\0';
+    for (unsigned i = 0; i < count && pos + 10 < cap; ++i) {
+        const int n = snprintf(buf + pos, cap - pos, i ? " %08x" : "%08x", words[i]);
+        if (n <= 0)
+            break;
+        pos += size_t(n);
+    }
+}
+
 static bool parseAwdlTuneDict(OSDictionary *tuneDict, MtkAwdl::PeerTuneRequest &req)
 {
-    if (!tuneDict || tuneDict->getCount() == 0 || tuneDict->getCount() > 8)
+    if (!tuneDict || tuneDict->getCount() == 0 || tuneDict->getCount() > 16)
         return false;
     OSCollectionIterator *iter = OSCollectionIterator::withCollection(tuneDict);
     if (!iter)
         return false;
     bool ok = true;
+    bool setResetStats = false;
+    bool hasDw = false, hasMask = false, hasVal = false;
     while (auto *keyObj = iter->getNextObject()) {
         auto *keySym = OSDynamicCast(OSSymbol, keyObj);
         const char *key = keySym ? keySym->getCStringNoCopy() : nullptr;
@@ -96,8 +110,49 @@ static bool parseAwdlTuneDict(OSDictionary *tuneDict, MtkAwdl::PeerTuneRequest &
         } else if (strcmp(key, "two_stage") == 0) {
             ok = readAwdlTuneBool(val, req.twoStage);
             req.setTwoStage = true;
+        } else if (strcmp(key, "bss_conn") == 0) {
+            ok = readAwdlTuneBool(val, req.bssConnected);
+            req.setBssConnected = true;
+        } else if (strcmp(key, "ap_role") == 0) {
+            ok = readAwdlTuneBool(val, req.apRole);
+            req.setApRole = true;
+        } else if (strcmp(key, "ra_fixed") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            if (!n || n->unsigned64BitValue() > 4) {
+                ok = false;
+                break;
+            }
+            req.raFixed = uint8_t(n->unsigned64BitValue());
+            req.setRaFixed = true;
+        } else if (strcmp(key, "dump_wtbl") == 0) {
+            ok = readAwdlTuneBool(val, req.dumpWtbl);
+        } else if (strcmp(key, "wtbl_dw") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            if (!n || n->unsigned64BitValue() >= 32) {
+                ok = false;
+                break;
+            }
+            req.wtblDw = uint8_t(n->unsigned64BitValue());
+            hasDw = true;
+        } else if (strcmp(key, "wtbl_mask") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            if (!n || n->unsigned64BitValue() == 0 || n->unsigned64BitValue() > 0xffffffffULL) {
+                ok = false;
+                break;
+            }
+            req.wtblMask = uint32_t(n->unsigned64BitValue());
+            hasMask = true;
+        } else if (strcmp(key, "wtbl_val") == 0) {
+            auto *n = OSDynamicCast(OSNumber, val);
+            if (!n || n->unsigned64BitValue() > 0xffffffffULL) {
+                ok = false;
+                break;
+            }
+            req.wtblVal = uint32_t(n->unsigned64BitValue());
+            hasVal = true;
         } else if (strcmp(key, "reset_stats") == 0) {
             ok = readAwdlTuneBool(val, req.resetStats);
+            setResetStats = true;
         } else {
             ok = false;
         }
@@ -105,7 +160,21 @@ static bool parseAwdlTuneDict(OSDictionary *tuneDict, MtkAwdl::PeerTuneRequest &
             break;
     }
     iter->release();
-    return ok;
+    if (!ok)
+        return false;
+    if (hasDw || hasMask || hasVal) {
+        if (!(hasDw && hasMask && hasVal))
+            return false;
+        req.setWtblPatch = true;
+    }
+    const bool hasConfigChange = req.setFixedBa || req.setMaxBw || req.setCapMask ||
+        req.setMatchingSco || req.setTwoStage || req.setBssConnected ||
+        req.setApRole || req.setRaFixed;
+    if (req.setWtblPatch && hasConfigChange)
+        return false;
+    if (!hasConfigChange && (req.dumpWtbl || req.setWtblPatch) && !setResetStats)
+        req.resetStats = false;
+    return true;
 }
 #endif
 
@@ -144,13 +213,63 @@ IOReturn AirportItlwm::setProperties(OSObject *properties)
                 return result;
             MtkAwdl::AnnouncementCompletions counts;
             if (self->fHalService->readAwdlAnnouncementCompletions(counts)) {
-                char summary[128];
+                char summary[192];
                 snprintf(summary, sizeof(summary),
-                    "gen=%u fixed_ba=%u max_bw=%u bw=%u cap_mask=0x%02x sco=%u two_stage=%u",
+                    "gen=%u fixed_ba=%u max_bw=%u bw=%u cap_mask=0x%02x sco=%u two_stage=%u bss_conn=%u ap_role=%u ra_fixed=%u",
                     counts.peerTuneGen, unsigned(counts.peerFixedBa), unsigned(counts.peerMaxBw),
                     unsigned(counts.peerBw), unsigned(counts.peerCapMask),
-                    unsigned(counts.peerMatchingSco), unsigned(counts.peerTwoStage));
+                    unsigned(counts.peerMatchingSco), unsigned(counts.peerTwoStage),
+                    unsigned(counts.peerBssConnected), unsigned(counts.peerApRole),
+                    unsigned(counts.peerRaFixed));
                 self->setProperty("MtkAwdlTuneApplied", summary);
+            }
+            MtkAwdl::WtblDiag diag;
+            if (self->fHalService->readAwdlWtblDiag(diag)) {
+                char row[160];
+                self->setProperty("MtkAwdlDiagWtblGen", diag.diagGen, 32);
+                self->setProperty("MtkAwdlDiagInfraWcid", diag.infraWcid, 16);
+                self->setProperty("MtkAwdlDiagPeerWcid", diag.peerWcid, 16);
+                if (diag.infraValid) {
+                    formatU32Words(row, sizeof(row), diag.infraWtbl, 16);
+                    self->setProperty("MtkAwdlDiagInfraWtbl0", row);
+                    formatU32Words(row, sizeof(row), diag.infraWtbl + 16, 16);
+                    self->setProperty("MtkAwdlDiagInfraWtbl1", row);
+                } else {
+                    self->setProperty("MtkAwdlDiagInfraWtbl0", "");
+                    self->setProperty("MtkAwdlDiagInfraWtbl1", "");
+                }
+                if (diag.peerValid) {
+                    formatU32Words(row, sizeof(row), diag.peerWtbl, 16);
+                    self->setProperty("MtkAwdlDiagPeerWtbl0", row);
+                    formatU32Words(row, sizeof(row), diag.peerWtbl + 16, 16);
+                    self->setProperty("MtkAwdlDiagPeerWtbl1", row);
+                } else {
+                    self->setProperty("MtkAwdlDiagPeerWtbl0", "");
+                    self->setProperty("MtkAwdlDiagPeerWtbl1", "");
+                }
+                if (diag.preRaValid) {
+                    formatU32Words(row, sizeof(row), diag.peerPreRaWtbl, 16);
+                    self->setProperty("MtkAwdlDiagPeerPreRaWtbl0", row);
+                } else {
+                    self->setProperty("MtkAwdlDiagPeerPreRaWtbl0", "");
+                }
+                if (diag.infraTxdValid) {
+                    formatU32Words(row, sizeof(row), diag.infraTxd, 8);
+                    self->setProperty("MtkAwdlDiagInfraTxd", row);
+                } else {
+                    self->setProperty("MtkAwdlDiagInfraTxd", "");
+                }
+                if (diag.peerTxdValid) {
+                    formatU32Words(row, sizeof(row), diag.peerTxd, 8);
+                    self->setProperty("MtkAwdlDiagPeerTxd", row);
+                } else {
+                    self->setProperty("MtkAwdlDiagPeerTxd", "");
+                }
+                if (diag.patchValid) {
+                    snprintf(row, sizeof(row), "dw=%u old=0x%08x new=0x%08x",
+                        unsigned(diag.patchDw), diag.patchOld, diag.patchNew);
+                    self->setProperty("MtkAwdlDiagLastPatch", row);
+                }
             }
             if (IOLockTryLock(self->awdlRegistrationLock)) {
                 if (!self->awdlStopping && self->fAwdlIf)

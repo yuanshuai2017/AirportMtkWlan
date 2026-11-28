@@ -38,7 +38,7 @@
 #include <net80211/ieee80211_var.h>
 
 #ifdef MTK_NATIVE_AWDL
-namespace MtkAwdl { struct AnnouncementCompletions; struct PeerTuneRequest; enum class TxKind : uint8_t; }
+namespace MtkAwdl { struct AnnouncementCompletions; struct PeerTuneRequest; struct WtblDiag; enum class TxKind : uint8_t; }
 #endif
 
 class MtkHalService : public OSObject {
@@ -78,6 +78,7 @@ public:
     virtual bool readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &) { return false; }
     virtual IOReturn setAwdlMacAddress(const uint8_t *, bool) { return kIOReturnUnsupported; }
     virtual IOReturn tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &) { return kIOReturnUnsupported; }
+    virtual bool readAwdlWtblDiag(MtkAwdl::WtblDiag &) { return false; }
 #endif
 
     /*

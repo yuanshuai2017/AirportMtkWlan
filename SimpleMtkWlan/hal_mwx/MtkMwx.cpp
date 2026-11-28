@@ -561,6 +561,17 @@ struct mwx_softc {
 	MwxAwdlPeer::WtblProfile sc_awdl_wtbl_profile;
 	MwxAwdlPeer::StationConfig sc_awdl_station_config;
 	uint32_t sc_awdl_tune_gen;
+	uint32_t sc_awdl_wtbl_diag_gen;
+	uint32_t sc_awdl_peer_wtbl_prera[16];
+	bool sc_awdl_peer_wtbl_prera_valid;
+	uint32_t sc_awdl_last_infra_txd[8];
+	bool sc_awdl_last_infra_txd_valid;
+	uint32_t sc_awdl_last_peer_txd[8];
+	bool sc_awdl_last_peer_txd_valid;
+	bool sc_awdl_wtbl_patch_valid;
+	uint8_t sc_awdl_wtbl_patch_dw;
+	uint32_t sc_awdl_wtbl_patch_old;
+	uint32_t sc_awdl_wtbl_patch_new;
 	uint32_t sc_awdl_txs_sampling;
 	uint8_t sc_awdl_ba_token;
 	uint8_t sc_awdl_peer_requested[IEEE80211_ADDR_LEN];
@@ -1257,6 +1268,9 @@ mwx_init_hw(struct ifnet *ifp)
 	MWX_DEV_LOG(sc, "init add dev ok\n");
 #if defined(MTK_NATIVE_AWDL) && defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
 	sc->sc_awdl_dev_active = false;
+	sc->sc_awdl_peer_quarantined = false;
+	sc->sc_awdl_peer = {};
+	sc->sc_awdl_peer_requested_channel = 0;
 	if (!sc->sc_awdl_tune_gen) {
 		int awdlBa = 1;
 		PE_parse_boot_argn("amtk_awdl_ba", &awdlBa, sizeof(awdlBa));
@@ -1266,16 +1280,23 @@ mwx_init_hw(struct ifnet *ifp)
 		PE_parse_boot_argn("amtk_awdl_fixed_ba", &awdlFixedBa, sizeof(awdlFixedBa));
 		sc->sc_awdl_rx_ba_enabled = sc->sc_awdl_ba_enabled && awdlRxBa != 0;
 		sc->sc_awdl_fixed_ba = awdlFixedBa != 0;
-		int awdlWtblProfile = 0;
-		PE_parse_boot_argn("amtk_awdl_wtbl_profile", &awdlWtblProfile, sizeof(awdlWtblProfile));
-		sc->sc_awdl_wtbl_profile = MwxAwdlPeer::wtblProfileFromBootArg(awdlWtblProfile);
-		sc->sc_awdl_station_config = MwxAwdlPeer::stationConfigFromProfile(sc->sc_awdl_wtbl_profile);
+		int awdlWtblProfile = -1;
+		if (PE_parse_boot_argn("amtk_awdl_wtbl_profile", &awdlWtblProfile, sizeof(awdlWtblProfile)) && awdlWtblProfile >= 0) {
+			sc->sc_awdl_wtbl_profile = MwxAwdlPeer::wtblProfileFromBootArg(awdlWtblProfile);
+			sc->sc_awdl_station_config = MwxAwdlPeer::stationConfigFromProfile(sc->sc_awdl_wtbl_profile);
+		} else {
+			sc->sc_awdl_wtbl_profile = MwxAwdlPeer::WtblProfile::MatchingSco;
+			sc->sc_awdl_station_config = MwxAwdlPeer::defaultStationConfig();
+		}
 		int awdlCapMask = -1;
 		if (PE_parse_boot_argn("amtk_awdl_cap_mask", &awdlCapMask, sizeof(awdlCapMask)) && awdlCapMask >= 0)
 			sc->sc_awdl_station_config.capMask = uint8_t(awdlCapMask) & MwxAwdlPeer::capMaskAll;
 		int awdlSco = -1;
 		if (PE_parse_boot_argn("amtk_awdl_sco", &awdlSco, sizeof(awdlSco)) && awdlSco >= 0)
 			sc->sc_awdl_station_config.matchingSco = awdlSco != 0;
+		int awdlApRole = -1;
+		if (PE_parse_boot_argn("amtk_awdl_ap_role", &awdlApRole, sizeof(awdlApRole)) && awdlApRole >= 0)
+			sc->sc_awdl_station_config.apRole = awdlApRole != 0;
 		int awdlBw = 80;
 		PE_parse_boot_argn("amtk_awdl_bw", &awdlBw, sizeof(awdlBw));
 		sc->sc_awdl_max_bw = MwxAwdlPeer::sanitizeMaxBw(awdlBw);
@@ -2546,6 +2567,21 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 		}
 		txp->txwi[1] = htole32(awdlTxd1);
 		txp->txwi[3] = htole32(txd3);
+		if (unicast && (mt->mt_awdl_aggregate || !sc->sc_awdl_last_peer_txd_valid)) {
+			for (unsigned i = 0; i < 8; ++i)
+				sc->sc_awdl_last_peer_txd[i] = le32toh(txp->txwi[i]);
+			sc->sc_awdl_last_peer_txd_valid = true;
+		}
+	} else if (ni && ni == sc->sc_ic.ic_bss &&
+	    !(le32toh(txp->txwi[2]) & MT_TXD2_MULTICAST) &&
+	    (!sc->sc_awdl_last_infra_txd_valid || !(le32toh(txp->txwi[3]) & MT_TXD3_BA_DISABLE))) {
+		const auto *wh = mtod(m, const struct ieee80211_frame *);
+		if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+		    !(wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_NODATA)) {
+			for (unsigned i = 0; i < 8; ++i)
+				sc->sc_awdl_last_infra_txd[i] = le32toh(txp->txwi[i]);
+			sc->sc_awdl_last_infra_txd_valid = true;
+		}
 	}
 #else
 	(void)awdlAnnouncement;
@@ -10535,6 +10571,48 @@ mwx_awdl_peer_radio_ready(struct mwx_softc *sc)
 	return sc->sc_fw_loaded && sc->sc_memh && !sc->sc_suspended;
 }
 
+static bool
+mwx_read_wtbl_lmac(struct mwx_softc *sc, uint16_t wcid, uint32_t *out, unsigned count)
+{
+	if (!sc || !out || count == 0 || count > 32 || wcid >= 128 ||
+	    !mwx_awdl_peer_radio_ready(sc) || sc->sc_detaching ||
+	    sc->sc_resetting || sc->sc_hard_reset)
+		return false;
+	const uint32_t oldWducr = mwx_read(sc, MT_WTBLON_TOP_WDUCR);
+	const bool changed = (oldWducr & MT_WTBLON_TOP_WDUCR_GROUP) != 0;
+	if (changed)
+		mwx_write(sc, MT_WTBLON_TOP_WDUCR, oldWducr & ~MT_WTBLON_TOP_WDUCR_GROUP);
+	for (unsigned dw = 0; dw < count; ++dw) {
+		const uint32_t addr = MT_WTBL_BASE | ((uint32_t(wcid) & 0x7fu) << 8) | (dw << 2);
+		out[dw] = mwx_read(sc, addr);
+	}
+	if (changed)
+		mwx_write(sc, MT_WTBLON_TOP_WDUCR, oldWducr);
+	return true;
+}
+
+static bool
+mwx_patch_wtbl_lmac(struct mwx_softc *sc, uint16_t wcid, uint8_t dw,
+    uint32_t mask, uint32_t val, uint32_t &oldVal, uint32_t &newVal)
+{
+	if (!sc || wcid != MwxAwdlPeer::wcid || dw >= 32 || mask == 0 ||
+	    !mwx_awdl_peer_radio_ready(sc) || sc->sc_detaching ||
+	    sc->sc_resetting || sc->sc_hard_reset)
+		return false;
+	const uint32_t oldWducr = mwx_read(sc, MT_WTBLON_TOP_WDUCR);
+	const bool changed = (oldWducr & MT_WTBLON_TOP_WDUCR_GROUP) != 0;
+	if (changed)
+		mwx_write(sc, MT_WTBLON_TOP_WDUCR, oldWducr & ~MT_WTBLON_TOP_WDUCR_GROUP);
+	const uint32_t addr = MT_WTBL_BASE | ((uint32_t(wcid) & 0x7fu) << 8) | (uint32_t(dw) << 2);
+	oldVal = mwx_read(sc, addr);
+	const uint32_t target = (oldVal & ~mask) | (val & mask);
+	mwx_write(sc, addr, target);
+	newVal = mwx_read(sc, addr);
+	if (changed)
+		mwx_write(sc, MT_WTBLON_TOP_WDUCR, oldWducr);
+	return true;
+}
+
 struct MwxAwdlPeerFirmware {
 	struct mwx_softc *sc;
 
@@ -10566,8 +10644,22 @@ struct MwxAwdlPeerFirmware {
 	uint32_t bss(const uint8_t *mac, uint8_t channel, bool enable) const {
 		if (!mwx_awdl_peer_radio_ready(sc))
 			return EIO;
-		auto request = MwxAwdlPeer::makeBssRequest(mac, channel, sc->sc_vif.wmm_idx, enable);
+		const auto &cfg = sc->sc_awdl_station_config;
+		const uint8_t *bssid = cfg.apRole ? sc->sc_awdl_mac : mac;
+		auto request = MwxAwdlPeer::makeBssRequest(bssid, channel, sc->sc_vif.wmm_idx, enable, cfg);
 		return mwx_awdl_send_command(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &request, sizeof(request));
+	}
+
+	uint32_t applyRaFixed(uint8_t channel, MwxAwdlPeer::ChannelWidth width) const {
+		if (!mwx_awdl_peer_radio_ready(sc))
+			return EIO;
+		const uint8_t mode = sc->sc_awdl_station_config.raFixed;
+		if (!mode)
+			return 0;
+		auto req = MwxAwdlPeer::makeRaFixedRequest(channel,
+		    sc->sc_capa.num_streams >= 2, width, mode);
+		const uint32_t cmd = mode == 4 ? MCU_EXT_CMD_STA_REC_UPDATE : MCU_UNI_CMD_STA_REC_UPDATE;
+		return mwx_awdl_send_command(sc, cmd, &req, sizeof(req));
 	}
 
 	uint32_t rlm(uint8_t channel, MwxAwdlPeer::ChannelWidth width) const {
@@ -10731,6 +10823,7 @@ mwx_awdl_peer_task(void *arg)
 			return kIOReturnSuccess;
 
 		sc->sc_awdl_peer_busy = true;
+		sc->sc_awdl_peer_wtbl_prera_valid = false;
 		MwxAwdlPeerFirmware firmware{sc};
 		auto failure = slot.replace(firmware, mac, channel, sc->sc_awdl_width);
 		if (failure.step == MwxAwdlPeer::FailStep::BssRlm &&
@@ -10739,6 +10832,15 @@ mwx_awdl_peer_task(void *arg)
 			failure = slot.replace(firmware, mac, channel, {CMD_CBW_20MHZ, channel});
 		}
 		sc->sc_awdl_completions.peerBw = slot.active ? slot.width.mhz() : 20;
+		if (slot.active && sc->sc_awdl_station_config.raFixed) {
+			sc->sc_awdl_peer_wtbl_prera_valid = mwx_read_wtbl_lmac(sc,
+			    MwxAwdlPeer::wcid, sc->sc_awdl_peer_wtbl_prera, 16);
+			const auto raStatus = firmware.applyRaFixed(channel, slot.width);
+			sc->sc_awdl_completions.peerRaFixedStatus = raStatus;
+			IOLog("MTK AWDL: peer WCID %u RA fixed mode=%u bw=%u status=0x%x\n",
+			    unsigned(MwxAwdlPeer::wcid), unsigned(sc->sc_awdl_station_config.raFixed),
+			    unsigned(slot.width.mhz()), raStatus);
+		}
 		if (failure)
 			mwx_awdl_peer_error(sc, failure);
 		if (!slot.active && slot.bssMayExist) {
@@ -11361,6 +11463,9 @@ bool MtkMwx::readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &c
 	counts.peerCapMask = com->sc_awdl_station_config.capMask;
 	counts.peerMatchingSco = com->sc_awdl_station_config.matchingSco;
 	counts.peerTwoStage = com->sc_awdl_station_config.twoStage;
+	counts.peerBssConnected = com->sc_awdl_station_config.bssConnected;
+	counts.peerApRole = com->sc_awdl_station_config.apRole;
+	counts.peerRaFixed = com->sc_awdl_station_config.raFixed;
 	counts.peerTuneGen = com->sc_awdl_tune_gen;
 	counts.peerRxBaEnabled = com->sc_awdl_rx_ba_enabled;
 	counts.peerBw = counts.peerWcidActive ? com->sc_awdl_peer.width.mhz() : 20;
@@ -11408,12 +11513,73 @@ IOReturn MtkMwx::setAwdlMacAddress(const uint8_t *mac, bool enable)
 	return error ? kIOReturnIOError : kIOReturnSuccess;
 }
 
+static void
+mwx_awdl_reset_tune_stats(struct mwx_softc *sc)
+{
+	auto &counts = sc->sc_awdl_completions;
+	counts.peerTxSampleRequests = 0;
+	counts.peerTxStatus = {};
+	counts.peerAggTxSent = 0;
+	counts.peerAggTxFailed = 0;
+	counts.peerAggLastStatus = 0;
+	counts.peerBaReqSent = 0;
+	counts.peerBaReqAcked = 0;
+	counts.peerBaReqFailed = 0;
+	counts.peerBaRespOk = 0;
+	counts.peerBaDelba = 0;
+	counts.peerBaErrors = 0;
+	counts.peerBaLastError = 0;
+	counts.peerWcidErrors = 0;
+	counts.peerWcidLastError = 0;
+	counts.peerWcidFailStep = 0;
+	sc->sc_awdl_peer_errors = 0;
+	sc->sc_awdl_peer_last_failure = {};
+	sc->sc_awdl_txs_sampling = 0;
+	sc->sc_awdl_rate_idx = 0;
+	sc->sc_awdl_rate_acks = 0;
+	sc->sc_awdl_rate_window = 0;
+	sc->sc_awdl_rate_fails = 0;
+	sc->sc_awdl_rate_consec_fails = 0;
+	sc->sc_awdl_rate_hold = 0;
+	counts.txRateIdx = 0;
+	sc->sc_awdl_last_peer_txd_valid = false;
+}
+
 IOReturn MtkMwx::tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &req)
 {
 	auto *sc = com;
 	auto *loop = getMainWorkLoop();
 	if (!sc || !loop || !loop->inGate() || sc->sc_detaching || sc->sc_resetting || sc->sc_suspended)
 		return kIOReturnNotReady;
+
+	const bool hasConfigChange = req.setFixedBa || req.setMaxBw || req.setCapMask ||
+	    req.setMatchingSco || req.setTwoStage || req.setBssConnected ||
+	    req.setApRole || req.setRaFixed;
+
+	if (!hasConfigChange && !req.setWtblPatch && req.dumpWtbl) {
+		if (req.resetStats)
+			mwx_awdl_reset_tune_stats(sc);
+		return kIOReturnSuccess;
+	}
+
+	if (!hasConfigChange && req.setWtblPatch) {
+		if (!sc->sc_awdl_peer.active || sc->sc_awdl_peer_busy)
+			return kIOReturnNotReady;
+		uint32_t oldVal = 0, newVal = 0;
+		if (!mwx_patch_wtbl_lmac(sc, MwxAwdlPeer::wcid, req.wtblDw,
+		    req.wtblMask, req.wtblVal, oldVal, newVal))
+			return kIOReturnIOError;
+		sc->sc_awdl_wtbl_patch_valid = true;
+		sc->sc_awdl_wtbl_patch_dw = req.wtblDw;
+		sc->sc_awdl_wtbl_patch_old = oldVal;
+		sc->sc_awdl_wtbl_patch_new = newVal;
+		if (req.resetStats)
+			mwx_awdl_reset_tune_stats(sc);
+		IOLog("MTK AWDL: wtbl patch wcid=%u dw=%u old=0x%08x mask=0x%08x val=0x%08x -> new=0x%08x\n",
+		    unsigned(MwxAwdlPeer::wcid), unsigned(req.wtblDw), oldVal,
+		    req.wtblMask, req.wtblVal, newVal);
+		return kIOReturnSuccess;
+	}
 
 	const bool prevActive = sc->sc_awdl_peer.active;
 	const uint8_t prevChannel = sc->sc_awdl_peer.channel;
@@ -11444,52 +11610,75 @@ IOReturn MtkMwx::tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &req)
 		sc->sc_awdl_station_config.matchingSco = req.matchingSco;
 	if (req.setTwoStage)
 		sc->sc_awdl_station_config.twoStage = req.twoStage;
+	if (req.setBssConnected)
+		sc->sc_awdl_station_config.bssConnected = req.bssConnected;
+	if (req.setApRole)
+		sc->sc_awdl_station_config.apRole = req.apRole;
+	if (req.setRaFixed)
+		sc->sc_awdl_station_config.raFixed = req.raFixed <= MwxAwdlPeer::raFixedMax ? req.raFixed : 0;
 
 	auto *node = (sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_ic.ic_bss) ? sc->sc_ic.ic_bss : nullptr;
 	sc->sc_awdl_width = mwx_awdl_associated_width(sc, node, sc->sc_awdl_tx_channel);
 	sc->sc_awdl_completions.peerBw = 20;
+	sc->sc_awdl_completions.peerRaFixedStatus = 0;
 	sc->sc_awdl_peer_retry_us = 0;
 
-	if (req.resetStats) {
-		auto &counts = sc->sc_awdl_completions;
-		counts.peerTxSampleRequests = 0;
-		counts.peerTxStatus = {};
-		counts.peerAggTxSent = 0;
-		counts.peerAggTxFailed = 0;
-		counts.peerAggLastStatus = 0;
-		counts.peerBaReqSent = 0;
-		counts.peerBaReqAcked = 0;
-		counts.peerBaReqFailed = 0;
-		counts.peerBaRespOk = 0;
-		counts.peerBaDelba = 0;
-		counts.peerBaErrors = 0;
-		counts.peerBaLastError = 0;
-		counts.peerWcidErrors = 0;
-		counts.peerWcidLastError = 0;
-		counts.peerWcidFailStep = 0;
-		sc->sc_awdl_peer_errors = 0;
-		sc->sc_awdl_peer_last_failure = {};
-		sc->sc_awdl_txs_sampling = 0;
-		sc->sc_awdl_rate_idx = 0;
-		sc->sc_awdl_rate_acks = 0;
-		sc->sc_awdl_rate_window = 0;
-		sc->sc_awdl_rate_fails = 0;
-		sc->sc_awdl_rate_consec_fails = 0;
-		sc->sc_awdl_rate_hold = 0;
-		counts.txRateIdx = 0;
-	}
+	if (req.resetStats)
+		mwx_awdl_reset_tune_stats(sc);
 
 	++sc->sc_awdl_tune_gen;
 	const bool rebuild = prevActive && prevChannel && prevChannel == sc->sc_awdl_tx_channel &&
 	    MwxAwdlPeer::validPeerMac(prevMac);
-	IOLog("MTK AWDL: hot-tune gen=%u fixed_ba=%u max_bw=%u width=%u cap_mask=0x%02x sco=%u two_stage=%u rebuild=%u\n",
+	IOLog("MTK AWDL: hot-tune gen=%u fixed_ba=%u max_bw=%u width=%u cap_mask=0x%02x sco=%u two_stage=%u bss_conn=%u ap_role=%u ra_fixed=%u rebuild=%u\n",
 	    sc->sc_awdl_tune_gen, unsigned(sc->sc_awdl_fixed_ba), unsigned(sc->sc_awdl_max_bw),
 	    unsigned(sc->sc_awdl_width.mhz()), unsigned(sc->sc_awdl_station_config.capMask),
 	    unsigned(sc->sc_awdl_station_config.matchingSco),
-	    unsigned(sc->sc_awdl_station_config.twoStage), unsigned(rebuild));
+	    unsigned(sc->sc_awdl_station_config.twoStage),
+	    unsigned(sc->sc_awdl_station_config.bssConnected),
+	    unsigned(sc->sc_awdl_station_config.apRole),
+	    unsigned(sc->sc_awdl_station_config.raFixed), unsigned(rebuild));
 	if (rebuild)
 		mwx_awdl_request_peer(sc, prevMac, prevChannel);
 	return kIOReturnSuccess;
+}
+
+bool MtkMwx::readAwdlWtblDiag(MtkAwdl::WtblDiag &diag)
+{
+	auto *sc = com;
+	auto *loop = getMainWorkLoop();
+	diag = {};
+	if (!sc || !loop || !loop->inGate() || !mwx_awdl_peer_radio_ready(sc) ||
+	    sc->sc_detaching || sc->sc_resetting || sc->sc_hard_reset)
+		return false;
+
+	const auto *ap = (sc->sc_ic.ic_state == IEEE80211_S_RUN) ? sc->sc_ic.ic_bss : nullptr;
+	const uint16_t infraWcid = ap ? reinterpret_cast<const struct mwx_node *>(ap)->wcid : 0;
+	diag.infraWcid = infraWcid;
+	diag.peerWcid = MwxAwdlPeer::wcid;
+	if (infraWcid > 0 && infraWcid < 128)
+		diag.infraValid = mwx_read_wtbl_lmac(sc, infraWcid, diag.infraWtbl, 32);
+	diag.peerValid = mwx_read_wtbl_lmac(sc, MwxAwdlPeer::wcid, diag.peerWtbl, 32);
+	if (sc->sc_awdl_peer_wtbl_prera_valid) {
+		memcpy(diag.peerPreRaWtbl, sc->sc_awdl_peer_wtbl_prera, sizeof(diag.peerPreRaWtbl));
+		diag.preRaValid = true;
+	}
+	if (sc->sc_awdl_last_infra_txd_valid) {
+		memcpy(diag.infraTxd, sc->sc_awdl_last_infra_txd, sizeof(diag.infraTxd));
+		diag.infraTxdValid = true;
+	}
+	if (sc->sc_awdl_last_peer_txd_valid) {
+		memcpy(diag.peerTxd, sc->sc_awdl_last_peer_txd, sizeof(diag.peerTxd));
+		diag.peerTxdValid = true;
+	}
+	if (sc->sc_awdl_wtbl_patch_valid) {
+		diag.patchValid = true;
+		diag.patchDw = sc->sc_awdl_wtbl_patch_dw;
+		diag.patchOld = sc->sc_awdl_wtbl_patch_old;
+		diag.patchNew = sc->sc_awdl_wtbl_patch_new;
+	}
+	diag.diagGen = ++sc->sc_awdl_wtbl_diag_gen;
+	diag.valid = diag.infraValid || diag.peerValid;
+	return diag.valid;
 }
 #endif
 

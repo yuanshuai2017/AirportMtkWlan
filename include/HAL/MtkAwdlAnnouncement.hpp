@@ -180,6 +180,10 @@ struct AnnouncementCompletions {
     uint8_t peerCapMask = 0;
     bool peerMatchingSco = false;
     bool peerTwoStage = false;
+    bool peerBssConnected = false;
+    bool peerApRole = false;
+    uint8_t peerRaFixed = 0;
+    uint32_t peerRaFixedStatus = 0;
     uint32_t peerTuneGen = 0;
     uint32_t dataInFlight = 0;
     uint8_t txRateIdx = 0;
@@ -227,7 +231,39 @@ struct PeerTuneRequest {
     bool matchingSco = false;
     bool setTwoStage = false;
     bool twoStage = false;
+    bool setBssConnected = false;
+    bool bssConnected = false;
+    bool setApRole = false;
+    bool apRole = false;
+    bool setRaFixed = false;
+    uint8_t raFixed = 0;
+    bool dumpWtbl = false;
+    bool setWtblPatch = false;
+    uint8_t wtblDw = 0;
+    uint32_t wtblMask = 0;
+    uint32_t wtblVal = 0;
     bool resetStats = true;
+};
+
+struct WtblDiag {
+    bool valid = false;
+    uint16_t infraWcid = 0;
+    uint16_t peerWcid = 0;
+    bool infraValid = false;
+    bool peerValid = false;
+    bool preRaValid = false;
+    bool infraTxdValid = false;
+    bool peerTxdValid = false;
+    uint32_t infraWtbl[32] = {};
+    uint32_t peerWtbl[32] = {};
+    uint32_t peerPreRaWtbl[16] = {};
+    uint32_t infraTxd[8] = {};
+    uint32_t peerTxd[8] = {};
+    bool patchValid = false;
+    uint8_t patchDw = 0;
+    uint32_t patchOld = 0;
+    uint32_t patchNew = 0;
+    uint32_t diagGen = 0;
 };
 
 constexpr uint32_t electionMetric = 60;

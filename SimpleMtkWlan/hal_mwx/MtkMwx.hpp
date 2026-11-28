@@ -58,6 +58,7 @@ public:
     bool readAwdlAnnouncementCompletions(MtkAwdl::AnnouncementCompletions &) override;
     IOReturn setAwdlMacAddress(const uint8_t *, bool) override;
     IOReturn tuneAwdlPeer(const MtkAwdl::PeerTuneRequest &) override;
+    bool readAwdlWtblDiag(MtkAwdl::WtblDiag &) override;
 #endif
     void publishHealthDiagnostics();
     void suspend() override;
